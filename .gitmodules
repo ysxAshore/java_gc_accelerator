@@ -1,0 +1,3 @@
+[submodule "jdk17u"]
+	path = jdk17u
+	url = git@github.com:ysxAshore/jdk17u.git
