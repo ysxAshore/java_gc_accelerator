@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ScalaCompilerConfiguration">
+    <option name="separateProdTestSources" value="true" />
+    <profile name="sbt 1" modules="hwgc" />
+    <profile name="sbt 2" modules="hwgc.main,hwgc.test">
+      <plugins>
+        <plugin path="$USER_HOME$/.cache/coursier/v1/https/repo1.maven.org/maven2/com/github/spinalhdl/spinalhdl-idsl-plugin_2.13/1.10.2a/spinalhdl-idsl-plugin_2.13-1.10.2a.jar" />
+      </plugins>
+    </profile>
+  </component>
+</project>
