@@ -23,7 +23,20 @@ trait GCParameters {
   val TypeArrayKlassID = 4
   val ObjectArrayKlassID = 5
 
+  // OopDesc
+  // --- Common Oop
+  val MarkWordOff = 0
+  val KlassOff = 8
+  val ElementOff = 16
+  // --- Array Oop
+  val ArrayLenOff = 16
   val ArrayElementOff = 24
+  // --- Ref Oop
+  val REFERENT_OFFSET = 16
+  val DISCOVERED_OFFSET = 40
+  // --- mirror Oop
+  val OopSizeOff = 36
+  val staticOopFieldCountOff = 40
 
   val LhKidOff = 8
   val VTableLenOff = 160
@@ -33,9 +46,16 @@ trait GCParameters {
   val VTableOff = 464
   val StaticFieldOff = 184
 
+  val TypeOffSet = 1
+  val Type_Young = 0
+  val Type_Humongous = -2
+  val Type_NoInCset = -1
+
+  val LogOfHRGrainBytes = 22
   val GCTaskQueue_Size = 1 << 17
   val GCScannerTask_Size = 8
   val GCObjectPtr_Size = 8
+  val GCHeapRegionAttr_Size = 2
 }
 
 trait HWParameters {
@@ -58,6 +78,7 @@ class GCParse2Trace extends Bundle with HWParameters with GCParameters with IMas
   val Valid = in Bool()
   val Ready = out Bool()
   // some config parameters
+  val RegionAttrBase = in UInt(MMUAddrWidth bits)
   val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
   val RegionAttrShiftBy = in UInt(IntWidth bits)
   val HeapRegionBias = in UInt(IntWidth bits)
