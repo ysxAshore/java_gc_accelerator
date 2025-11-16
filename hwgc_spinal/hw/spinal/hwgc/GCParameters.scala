@@ -51,6 +51,29 @@ trait GCParameters {
   val Type_Humongous = -2
   val Type_NoInCset = -1
 
+  /*-------------- G1ParScanThreadState ------------*/
+  val QSET_OFFSET = 24
+  val PSS_CARD_TABLE_OFFSET = 96
+  val PLAB_ALLOCATOR_OFFSET = 112
+  val AGE_TABLE_OFFSET = 120
+  val REGION_ATTR_DEST_OFFSET = 376
+  val TENURING_THRESHOLD_OFFSET = 380
+  val OBJCLOSURE_OFFSET = 384
+  val LAST_ENQUEUED_CARD_OFFSET = 432
+  val SURVIVING_YOUNG_WORDS_BASE_OFFSET = 464
+  val OLD_GEN_IS_FULL_OFFSET = 488
+  val PARTIAL_ARRAY_CHUNK_SIZE_OFFSET = 492
+  val PARTIAL_ARRAY_STEPPER_OFFSET = 496
+  val OBJ_ALLOC_STAT_OFFSET = 560
+
+  /*-------------------- ObjClosure -----------------*/
+  val SCANNING_IN_YOUNG_OFFSET = 32
+
+
+  /*--------------------- CardTable -----------------*/
+  val BYTE_MAP_OFFSET = 56
+  val BYTE_MAP_BASE_OFFSET = 64
+
   val LogOfHRGrainBytes = 22
   val GCTaskQueue_Size = 1 << 17
   val GCScannerTask_Size = 8

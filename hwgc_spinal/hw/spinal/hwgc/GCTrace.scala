@@ -20,9 +20,16 @@ case class Stage2Data() extends Bundle with GCParameters with HWParameters {
   val src = UInt(MMUAddrWidth bits)
   val dest = UInt(MMUAddrWidth bits)
   val obj = UInt(MMUAddrWidth bits)
-  val regionAttrType = UInt(8 bits)
+  val regionAttr = UInt(16 bits)
 }
 
+case class Stage6Data() extends Bundle with GCParameters with HWParameters {
+  val src = UInt(MMUAddrWidth bits)
+  val dest = UInt(MMUAddrWidth bits)
+  val obj = UInt(MMUAddrWidth bits)
+  val regionAttr = UInt(16 bits)
+  val cardIndex = UInt(MMUAddrWidth bits)
+}
 
 class GCTrace extends Module with GCParameters with HWParameters{
   val io = new Bundle {
@@ -146,12 +153,21 @@ class GCTrace extends Module with GCParameters with HWParameters{
     val s2Valid = RegInit(False)
     val s3Valid = RegInit(False)
     val s4Valid = RegInit(False)
+    val s5Valid = RegInit(False)
+    val s6Valid = RegInit(False)
+    val s7Valid = RegInit(False)
+    val s8Valid = RegInit(False)
+    val s9Valid = RegInit(False)
 
     val s0Reg = Reg(Stage0Data())
     val s1Reg = Reg(Stage1Data())
     val s2Reg = Reg(Stage2Data())
     val s3Reg = Reg(Stage2Data())
     val s4Reg = Reg(Stage2Data())
+    val s5Reg = Reg(Stage2Data())
+    val s6Reg = Reg(Stage6Data())
+    val s7Reg = Reg(Stage6Data())
+    val s9Reg = Reg(Stage6Data())
 
     traceTaskFifo.io.pop.ready := !s0Valid
     when(traceTaskFifo.io.pop.fire){
@@ -162,7 +178,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     when(s0Valid && !s1Valid){
       io.LocalMMUIO.Request.valid := True
       io.LocalMMUIO.Request.payload.RequestVirtualAddr := s0Reg.src
-      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
       io.LocalMMUIO.Request.payload.RequestType_isWrite := False
       io.LocalMMUIO.Response.ready := True
       when(io.LocalMMUIO.Response.fire){
@@ -179,25 +195,25 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
     when(s1Valid && !s2Valid){
       io.LocalMMUIO.Request.valid := True
-      io.LocalMMUIO.Request.payload.RequestVirtualAddr := RegionAttrBiasedBase + (s1Reg.obj >> RegionAttrShiftBy) * GCHeapRegionAttr_Size + TypeOffSet
-      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+      io.LocalMMUIO.Request.payload.RequestVirtualAddr := RegionAttrBiasedBase + (s1Reg.obj >> RegionAttrShiftBy) * GCHeapRegionAttr_Size
+      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
       io.LocalMMUIO.Request.payload.RequestType_isWrite := False
       io.LocalMMUIO.Response.ready := True
       when(io.LocalMMUIO.Response.fire){
         io.LocalMMUIO.Request.valid := False
         s1Valid := False
-        when(!(io.LocalMMUIO.Response.payload.ResponseData(7 downto 0).asSInt < Type_Young && (s1Reg.dest ^ s1Reg.obj) >> LogOfHRGrainBytes === 0)){
+        when(!(io.LocalMMUIO.Response.payload.ResponseData(15 downto 8).asSInt < Type_Young && (s1Reg.dest ^ s1Reg.obj) >> LogOfHRGrainBytes === 0)){
           s2Valid := True
           s2Reg.src := s1Reg.src
           s2Reg.dest := s1Reg.dest
           s2Reg.obj := s1Reg.obj
-          s2Reg.regionAttrType := io.LocalMMUIO.Response.ResponseData(7 downto 0)
+          s2Reg.regionAttr := io.LocalMMUIO.Response.ResponseData(15 downto 0)
         }
       }
     }
 
     when(s2Valid && !s3Valid){
-      when(s2Reg.regionAttrType.asSInt >= Type_Young){
+      when(s2Reg.regionAttr(15 downto 8).asSInt >= Type_Young){
         io.Trace2Stack.valid := True
         io.Trace2Stack.payload := s2Reg.dest
         when(io.Trace2Stack.fire){
@@ -212,17 +228,17 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
     val s3_subState = RegInit(sub_state.s_0)
     when(s3Valid && !s4Valid){
-      when(s3Reg.regionAttrType.asSInt === Type_Humongous){
+      when(s3Reg.regionAttr(15 downto 8).asSInt === Type_Humongous){
         switch(s3_subState){
           is(sub_state.s_0){
             io.LocalMMUIO.Request.valid := True
             io.LocalMMUIO.Request.payload.RequestVirtualAddr := HumongousReclaimCandidatesBoolBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
             io.LocalMMUIO.Request.payload.RequestType_isWrite := False
             io.LocalMMUIO.Response.ready := True
             when(io.LocalMMUIO.Response.fire) {
               io.LocalMMUIO.Request.valid := False
-              when(io.LocalMMUIO.Response.payload.ResponseData(0) === 0){
+              when(io.LocalMMUIO.Response.payload.ResponseData(0) === U(0)){
                 s4Valid := True
                 s4Reg := s3Reg
                 s3Valid := False
@@ -234,7 +250,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
           is(sub_state.s_1){
             io.LocalMMUIO.Request.valid := True
             io.LocalMMUIO.Request.payload.RequestVirtualAddr := HumongousReclaimCandidatesBoolBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
             io.LocalMMUIO.Request.payload.RequestType_isWrite := True
             io.LocalMMUIO.Request.payload.RequestData := 0 // 只写1字节
             io.LocalMMUIO.Response.ready := True
@@ -246,7 +262,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
           is(sub_state.s_2){
             io.LocalMMUIO.Request.valid := True
             io.LocalMMUIO.Request.payload.RequestVirtualAddr := RegionAttrBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes) * GCHeapRegionAttr_Size
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
             io.LocalMMUIO.Request.payload.RequestType_isWrite := True
             io.LocalMMUIO.Request.payload.RequestData := U(Type_NoInCset) // 只写1字节
             io.LocalMMUIO.Response.ready := True
@@ -265,7 +281,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
         s3Valid := False
       }
     }
-
   }
 
   val arrayTrace_subState = RegInit(sub_state.s_0)
@@ -337,7 +352,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         //access (SrcOopPtr + staticOopFieldOff)
         io.LocalMMUIO.Request.valid := True
         io.LocalMMUIO.Request.payload.RequestVirtualAddr := SrcOopPtr + staticOopFieldCountOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
         io.LocalMMUIO.Request.payload.RequestType_isWrite := False
         io.LocalMMUIO.Response.ready := True
         when(io.LocalMMUIO.Response.fire){
@@ -372,7 +387,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         // access (KlassPtr + VTableLenOff) to get the vtableLen
         io.LocalMMUIO.Request.valid := True
         io.LocalMMUIO.Request.payload.RequestVirtualAddr := KlassPtr + VTableLenOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
         io.LocalMMUIO.Request.payload.RequestType_isWrite := False
         io.LocalMMUIO.Response.ready := True
         when(io.LocalMMUIO.Response.fire){
@@ -385,7 +400,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         // access (KlassPtr + NonStaticOopMapSizeOff) to get the itableLen and nonStaticOopMapSize
         io.LocalMMUIO.Request.valid := True
         io.LocalMMUIO.Request.payload.RequestVirtualAddr := KlassPtr + ITableLenOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID
+        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
         io.LocalMMUIO.Request.payload.RequestType_isWrite := False
         io.LocalMMUIO.Response.ready := True
         when(io.LocalMMUIO.Response.fire){
@@ -441,6 +456,5 @@ class GCTrace extends Module with GCParameters with HWParameters{
   when(state === overall_state.s_end){
     state := overall_state.s_idle
   }
-
 
 }
