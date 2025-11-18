@@ -9,12 +9,14 @@ trait GCParameters {
   val GCTaskStack_SpillNeed = 63
   val GCTaskStack_ReadNeed = 8
 
+  /* ----------------- ScannerTask Tag ----------------- */
+  val OopTag = 0
+  val NarrowOopTag = 1
   val PartialArrayTag = 2
-
-  val GCOopTypeWidth = 2
   val CommonOop = 0
   val CompressedOop = 1
   val PartialArrayOop = 2
+  val GCOopTypeWidth = 2
 
   val InstanceKlassID = 0
   val InstanceRefKlassID = 1
@@ -70,9 +72,16 @@ trait GCParameters {
   val SCANNING_IN_YOUNG_OFFSET = 32
 
 
+  /*------------------- RDC Qset --------------------*/
+  val QSET_QUEUE_OFFSET = 48
+
   /*--------------------- CardTable -----------------*/
   val BYTE_MAP_OFFSET = 56
   val BYTE_MAP_BASE_OFFSET = 64
+
+  /*------------------- PtrQueue --------------------*/
+  val INDEX_OFFSET = 0
+  val BUFFER_OFFSET = 16
 
   val LogOfHRGrainBytes = 22
   val GCTaskQueue_Size = 1 << 17
@@ -91,10 +100,57 @@ trait HWParameters {
 
   val LLCSourceMaxNum = 64
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
+
+  // helper: issueReq
+  def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, WriteStrb: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
+
+    // ensure default safe values (caller may have already set globals; safe to reassign)
+    port.Request.valid := False
+    port.Response.ready := False
+
+    // Issue request if not already issued
+    when(!reqIssued) {
+      port.Request.valid := True
+      // payload fields (these must exist on your Request bundle)
+      port.Request.payload.RequestVirtualAddr := addr
+      port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
+      port.Request.payload.RequestType_isWrite := Write
+      port.Request.payload.RequestWStrb := WriteStrb
+      port.Request.payload.RequestData := WriteData
+      port.Response.ready := True
+
+      // mark as issued when downstream accepts the request
+      when(port.Request.fire) {
+        reqIssued := True
+      }
+    }
+
+    // handle response (when previously issued)
+    when(reqIssued && port.Response.fire) {
+      val rd = port.Response.payload.ResponseData
+      reqIssued := False
+      onResp(rd) // callback to let caller handle response data
+    }
+  }
 }
 
 class DebugInfoIO() extends Bundle with HWParameters{
   val DebugTimeStampe = UInt(64 bits)
+}
+
+class ProcessUnit extends Bundle with HWParameters with GCParameters with IMasterSlave {
+  val Valid = in Bool()
+  val Ready = out Bool()
+
+  val Done = out Bool()
+
+  val OopType = in UInt(GCOopTypeWidth bits)
+  val SrcOopPtr = in UInt(MMUAddrWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done)
+    out(Valid, OopType, SrcOopPtr)
+  }
 }
 
 class GCParse2Trace extends Bundle with HWParameters with GCParameters with IMasterSlave{
@@ -142,6 +198,31 @@ class GCTaskStackConfigIO extends Bundle with HWParameters with IMasterSlave{
   }
 }
 
+class TraceMReq2MMU(oopWorkStage:Int, oopTraceStates:Int) extends Bundle with IMasterSlave {
+  val oopWorkMReqs  = Vec.fill(oopWorkStage)(new LocalMMUIO)
+  val staticMReq    = new LocalMMUIO
+  val oopTraceMReqs = Vec.fill(oopTraceStates)(new LocalMMUIO)
+
+  override def asMaster(): Unit = {
+    oopWorkMReqs.foreach(master(_))
+    master(staticMReq)
+    oopTraceMReqs.foreach(master(_))
+  }
+}
+
+class AopParameters extends Bundle with HWParameters with IMasterSlave{
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+  val ParScanThreadStatePtr = in(UInt(MMUAddrWidth bits))
+  val DestOopPtr = in(UInt(MMUAddrWidth bits))
+
+  override def asMaster(): Unit = {
+    in(Ready, Done)
+    out(Valid, ParScanThreadStatePtr, DestOopPtr)
+  }
+}
+
 class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
   //发出的访存请求
   val Request = master Stream(new Bundle{
@@ -149,6 +230,7 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
     val RequestData = UInt(MMUDataWidth bits)
     val RequestSourceID = UInt(LLCSourceMaxNumBitSize bits)
     val RequestType_isWrite = Bool()
+    val RequestWStrb = UInt(MMUDataWidth / 8 bits)
   })
 
   //读请求分发到的TL Link的事务编号

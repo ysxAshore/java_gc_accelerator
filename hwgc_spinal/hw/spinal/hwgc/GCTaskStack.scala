@@ -49,6 +49,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   io.LocalMMUIO.Request.payload.RequestData := U(0)
   io.LocalMMUIO.Request.payload.RequestSourceID := U(0)
   io.LocalMMUIO.Request.payload.RequestType_isWrite := False
+  io.LocalMMUIO.Request.payload.RequestWStrb.clearAll()
   io.LocalMMUIO.Request.payload.RequestVirtualAddr.clearAll()
   io.LocalMMUIO.Response.ready := False
   io.ConfigIO.TaskEndValid := False

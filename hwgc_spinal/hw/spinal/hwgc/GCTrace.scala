@@ -5,47 +5,63 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
-case class Stage0Data() extends Bundle with GCParameters with HWParameters {
+case class TaskData() extends Bundle with GCParameters with HWParameters{
   val src = UInt(MMUAddrWidth bits)
   val dest = UInt(MMUAddrWidth bits)
 }
 
-case class Stage1Data() extends Bundle with GCParameters with HWParameters {
-  val src = UInt(MMUAddrWidth bits)
-  val dest = UInt(MMUAddrWidth bits)
-  val obj = UInt(MMUAddrWidth bits)
-}
-
-case class Stage2Data() extends Bundle with GCParameters with HWParameters {
+case class StageData() extends Bundle with GCParameters with HWParameters {
   val src = UInt(MMUAddrWidth bits)
   val dest = UInt(MMUAddrWidth bits)
   val obj = UInt(MMUAddrWidth bits)
   val regionAttr = UInt(16 bits)
 }
 
-case class Stage6Data() extends Bundle with GCParameters with HWParameters {
-  val src = UInt(MMUAddrWidth bits)
-  val dest = UInt(MMUAddrWidth bits)
-  val obj = UInt(MMUAddrWidth bits)
-  val regionAttr = UInt(16 bits)
-  val cardIndex = UInt(MMUAddrWidth bits)
-}
-
-class GCTrace extends Module with GCParameters with HWParameters{
+class GCTrace(oopWorkStages:Int) extends Module with GCParameters with HWParameters{
   val io = new Bundle {
-    val LocalMMUIO = master(new LocalMMUIO)
+    val TraceMMUIO = master(new TraceMReq2MMU(oopWorkStages - 1, 4))
     val DebugInfo = in(new DebugInfoIO)
-    val Parse2Trace = slave(new GCParse2Trace)
+    val ToTrace = slave(new GCParse2Trace)
     val Trace2Stack = master Stream UInt(MMUAddrWidth bits)
+    val Trace2Aop = master(new AopParameters)
   }
 
+  // default value
+  for(i <- 0 until oopWorkStages){
+    io.TraceMMUIO.oopWorkMReqs(i).Request.valid := False
+    io.TraceMMUIO.oopWorkMReqs(i).Request.payload.clearAll()
+    io.TraceMMUIO.oopWorkMReqs(i).Response.ready := False
+  }
+  for(i <- 0 until 4){
+    io.TraceMMUIO.oopTraceMReqs(i).Request.valid := False
+    io.TraceMMUIO.oopTraceMReqs(i).Request.payload.clearAll()
+    io.TraceMMUIO.oopTraceMReqs(i).Response.ready := False
+  }
+  io.TraceMMUIO.staticMReq.Request.valid := False
+  io.TraceMMUIO.staticMReq.Request.payload.clearAll()
+  io.TraceMMUIO.staticMReq.Response.ready := False
+
+  io.ToTrace.Ready := False
+
+  io.Trace2Stack.valid := False
+  io.Trace2Stack.payload.clearAll()
+
   // State Machine
-  // 0: Idle 1: Read 2: Work 3: End
   object overall_state extends SpinalEnum {
-    val s_idle, s_arrayPush, s_arrayTrace, s_refKlassTrace, s_staticTrace, s_oopTrace, s_doOopWork, s_end = newElement()
+    val s_idle, s_arrayPush, s_arrayTrace, s_refKlassTrace, s_staticTrace, s_oopTrace, s_end = newElement()
   }
   object sub_state extends SpinalEnum{
     val s_0, s_1, s_2, s_3, s_4 = newElement()
+  }
+
+  // helper: pushStack
+  def pushFifo(src: UInt, dest: UInt): Bool = {
+    traceTaskFifo.io.push.valid := True
+    traceTaskFifo.io.push.payload.src := src
+    traceTaskFifo.io.push.payload.dest := dest
+
+    val pushed = traceTaskFifo.io.push.fire
+    pushed
   }
 
   val state = RegInit(overall_state.s_idle)
@@ -67,29 +83,29 @@ class GCTrace extends Module with GCParameters with HWParameters{
   val StepNCreate = RegInit(U(0, IntWidth bits))
 
   when(state === overall_state.s_idle){
-    io.Parse2Trace.Ready := True
-    when(io.Parse2Trace.Valid && io.Parse2Trace.Ready){
-      RegionAttrBase := io.Parse2Trace.RegionAttrBase
-      RegionAttrBiasedBase:= io.Parse2Trace.RegionAttrBiasedBase
-      RegionAttrShiftBy := io.Parse2Trace.RegionAttrShiftBy
-      HeapRegionBias := io.Parse2Trace.HeapRegionBias
-      HeapRegionShiftBy := io.Parse2Trace.HeapRegionShiftBy
-      HumongousReclaimCandidatesBoolBase := io.Parse2Trace.HumongousReclaimCandidatesBoolBase
-      ParScanThreadStatePtr := io.Parse2Trace.ParScanThreadStatePtr
-      KlassPtr := io.Parse2Trace.KlassPtr
-      SrcOopPtr := io.Parse2Trace.SrcOopPtr
-      DestOopPtr := io.Parse2Trace.DestOopPtr
-      Kid := io.Parse2Trace.Kid
-      ArrayLength := io.Parse2Trace.ArrayLength
-      PartialArrayStart := Mux(io.Parse2Trace.OopType === PartialArrayOop, io.Parse2Trace.PartialArrayStart, U(0))
-      StepIndex := io.Parse2Trace.StepIndex
-      StepNCreate := io.Parse2Trace.StepNCreate
+    io.ToTrace.Ready := True
+    when(io.ToTrace.Valid && io.ToTrace.Ready){
+      RegionAttrBase := io.ToTrace.RegionAttrBase
+      RegionAttrBiasedBase:= io.ToTrace.RegionAttrBiasedBase
+      RegionAttrShiftBy := io.ToTrace.RegionAttrShiftBy
+      HeapRegionBias := io.ToTrace.HeapRegionBias
+      HeapRegionShiftBy := io.ToTrace.HeapRegionShiftBy
+      HumongousReclaimCandidatesBoolBase := io.ToTrace.HumongousReclaimCandidatesBoolBase
+      ParScanThreadStatePtr := io.ToTrace.ParScanThreadStatePtr
+      KlassPtr := io.ToTrace.KlassPtr
+      SrcOopPtr := io.ToTrace.SrcOopPtr
+      DestOopPtr := io.ToTrace.DestOopPtr
+      Kid := io.ToTrace.Kid
+      ArrayLength := io.ToTrace.ArrayLength
+      PartialArrayStart := Mux(io.ToTrace.OopType === PartialArrayOop, io.ToTrace.PartialArrayStart, U(0))
+      StepIndex := io.ToTrace.StepIndex
+      StepNCreate := io.ToTrace.StepNCreate
 
-      when(io.Parse2Trace.OopType === PartialArrayOop || io.Parse2Trace.Kid === ObjectArrayKlassID){
+      when(io.ToTrace.OopType === PartialArrayOop || io.ToTrace.Kid === ObjectArrayKlassID){
         state := overall_state.s_arrayPush
-      }.elsewhen(io.Parse2Trace.Kid === InstanceRefKlassID){
+      }.elsewhen(io.ToTrace.Kid === InstanceRefKlassID){
         state := overall_state.s_refKlassTrace
-      }.elsewhen(io.Parse2Trace.Kid === InstanceMirrorKlassID){
+      }.elsewhen(io.ToTrace.Kid === InstanceMirrorKlassID){
         state := overall_state.s_staticTrace
       }.otherwise{
         state := overall_state.s_oopTrace
@@ -100,22 +116,22 @@ class GCTrace extends Module with GCParameters with HWParameters{
           report(Seq(
             "[GCTrace<", io.DebugInfo.DebugTimeStampe,
             ">] GCParse to GCTrace",
-            ", RegionAttrBase = ", io.Parse2Trace.RegionAttrBase,
-            ", RegionAttrBiasedBase = ", io.Parse2Trace.RegionAttrBiasedBase,
-            ", RegionAttrShiftBy = ", io.Parse2Trace.RegionAttrShiftBy,
-            ", HeapRegionBias = ", io.Parse2Trace.HeapRegionBias,
-            ", HeapRegionShiftBy = ", io.Parse2Trace.HeapRegionShiftBy,
-            ", HumongousReclaimCandidatesBoolBase = ", io.Parse2Trace.HumongousReclaimCandidatesBoolBase,
-            ", ParScanThreadStatePtr = ", io.Parse2Trace.ParScanThreadStatePtr,
-            ", OopType = ", io.Parse2Trace.OopType,
-            ", KlassPtr = ", io.Parse2Trace.KlassPtr,
-            ", SrcOopPtr = ", io.Parse2Trace.SrcOopPtr,
-            ", DestOopPtr = ", io.Parse2Trace.DestOopPtr,
-            ", Kid = ", io.Parse2Trace.Kid, "\n",
-            ", ArrayLength = ", io.Parse2Trace.ArrayLength,
-            ", PartialArrayStart = ", io.Parse2Trace.PartialArrayStart,
-            ", StepIndex = ", io.Parse2Trace.StepIndex,
-            ", StepNCreate = ", io.Parse2Trace.StepNCreate, "\n"
+            ", RegionAttrBase = ", io.ToTrace.RegionAttrBase,
+            ", RegionAttrBiasedBase = ", io.ToTrace.RegionAttrBiasedBase,
+            ", RegionAttrShiftBy = ", io.ToTrace.RegionAttrShiftBy,
+            ", HeapRegionBias = ", io.ToTrace.HeapRegionBias,
+            ", HeapRegionShiftBy = ", io.ToTrace.HeapRegionShiftBy,
+            ", HumongousReclaimCandidatesBoolBase = ", io.ToTrace.HumongousReclaimCandidatesBoolBase,
+            ", ParScanThreadStatePtr = ", io.ToTrace.ParScanThreadStatePtr,
+            ", OopType = ", io.ToTrace.OopType,
+            ", KlassPtr = ", io.ToTrace.KlassPtr,
+            ", SrcOopPtr = ", io.ToTrace.SrcOopPtr,
+            ", DestOopPtr = ", io.ToTrace.DestOopPtr,
+            ", Kid = ", io.ToTrace.Kid, "\n",
+            ", ArrayLength = ", io.ToTrace.ArrayLength,
+            ", PartialArrayStart = ", io.ToTrace.PartialArrayStart,
+            ", StepIndex = ", io.ToTrace.StepIndex,
+            ", StepNCreate = ", io.ToTrace.StepNCreate, "\n"
           ))
         }
       }
@@ -136,156 +152,167 @@ class GCTrace extends Module with GCParameters with HWParameters{
     }
   }
 
-  val p = RegInit(U(0, IntWidth bits))
-  val q = RegInit(U(0, IntWidth bits))
-  val prev_state = RegInit(overall_state.s_idle)
-
   val traceTaskFifo = StreamFifo(
-    dataType = Stage0Data(),
+    dataType = TaskData(),
     depth = 8
   )
+  traceTaskFifo.io.push.valid := False
+  traceTaskFifo.io.push.clearAll()
+  traceTaskFifo.io.pop.ready := False
 
   val doOopWork = new Area{
-    //The parameters such as pssptr are the same in a batch
+    // MMU req and resp
+    val sReqIssued = Vec(RegInit(False), oopWorkStages - 1)
+    val sValid = Vec(RegInit(False), oopWorkStages)
+    val sReg = Vec(RegInit(StageData().getZero), oopWorkStages)
 
-    val s0Valid = RegInit(False)
-    val s1Valid = RegInit(False)
-    val s2Valid = RegInit(False)
-    val s3Valid = RegInit(False)
-    val s4Valid = RegInit(False)
-    val s5Valid = RegInit(False)
-    val s6Valid = RegInit(False)
-    val s7Valid = RegInit(False)
-    val s8Valid = RegInit(False)
-    val s9Valid = RegInit(False)
-
-    val s0Reg = Reg(Stage0Data())
-    val s1Reg = Reg(Stage1Data())
-    val s2Reg = Reg(Stage2Data())
-    val s3Reg = Reg(Stage2Data())
-    val s4Reg = Reg(Stage2Data())
-    val s5Reg = Reg(Stage2Data())
-    val s6Reg = Reg(Stage6Data())
-    val s7Reg = Reg(Stage6Data())
-    val s9Reg = Reg(Stage6Data())
-
-    traceTaskFifo.io.pop.ready := !s0Valid
+    traceTaskFifo.io.pop.ready := !sValid(0)
     when(traceTaskFifo.io.pop.fire){
-      s0Reg := traceTaskFifo.io.pop.payload
-      s0Valid := True
+      sReg(0).src := traceTaskFifo.io.pop.payload.src
+      sReg(0).dest := traceTaskFifo.io.pop.payload.dest
+      sValid(0) := True
     }
 
-    when(s0Valid && !s1Valid){
-      io.LocalMMUIO.Request.valid := True
-      io.LocalMMUIO.Request.payload.RequestVirtualAddr := s0Reg.src
-      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-      io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-      io.LocalMMUIO.Response.ready := True
-      when(io.LocalMMUIO.Response.fire){
-        io.LocalMMUIO.Request.valid := False
-        s0Valid := False
-        when(io.LocalMMUIO.Response.payload.ResponseData =/= 0){
-          s1Valid := True
-          s1Reg.src := s0Reg.src
-          s1Reg.dest := s0Reg.dest
-          s1Reg.obj := io.LocalMMUIO.Response.ResponseData
-        }
-      }
-    }
+    // process every stage mmu req 0~13
+    for(i <- 0 until oopWorkStages - 1){
+      val want = Bool()
+      val addr = UInt(MMUAddrWidth bits)
+      val isWrite = Bool()
+      val wdata = UInt(MMUAddrWidth bits)
+      val wmask = UInt(MMUDataWidth / 8 bits)
 
-    when(s1Valid && !s2Valid){
-      io.LocalMMUIO.Request.valid := True
-      io.LocalMMUIO.Request.payload.RequestVirtualAddr := RegionAttrBiasedBase + (s1Reg.obj >> RegionAttrShiftBy) * GCHeapRegionAttr_Size
-      io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-      io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-      io.LocalMMUIO.Response.ready := True
-      when(io.LocalMMUIO.Response.fire){
-        io.LocalMMUIO.Request.valid := False
-        s1Valid := False
-        when(!(io.LocalMMUIO.Response.payload.ResponseData(15 downto 8).asSInt < Type_Young && (s1Reg.dest ^ s1Reg.obj) >> LogOfHRGrainBytes === 0)){
-          s2Valid := True
-          s2Reg.src := s1Reg.src
-          s2Reg.dest := s1Reg.dest
-          s2Reg.obj := s1Reg.obj
-          s2Reg.regionAttr := io.LocalMMUIO.Response.ResponseData(15 downto 0)
-        }
-      }
-    }
+      want := False
+      addr := U(0)
+      isWrite := False
+      wdata := U(0)
+      wmask := U(0)
 
-    when(s2Valid && !s3Valid){
-      when(s2Reg.regionAttr(15 downto 8).asSInt >= Type_Young){
-        io.Trace2Stack.valid := True
-        io.Trace2Stack.payload := s2Reg.dest
-        when(io.Trace2Stack.fire){
-          io.Trace2Stack.valid := False
-          s2Valid := False
-        }
-      }.otherwise{
-        s3Valid := True
-        s3Reg := s2Reg
-      }
-    }
-
-    val s3_subState = RegInit(sub_state.s_0)
-    when(s3Valid && !s4Valid){
-      when(s3Reg.regionAttr(15 downto 8).asSInt === Type_Humongous){
-        switch(s3_subState){
-          is(sub_state.s_0){
-            io.LocalMMUIO.Request.valid := True
-            io.LocalMMUIO.Request.payload.RequestVirtualAddr := HumongousReclaimCandidatesBoolBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-            io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-            io.LocalMMUIO.Response.ready := True
-            when(io.LocalMMUIO.Response.fire) {
-              io.LocalMMUIO.Request.valid := False
-              when(io.LocalMMUIO.Response.payload.ResponseData(0) === U(0)){
-                s4Valid := True
-                s4Reg := s3Reg
-                s3Valid := False
-              }.otherwise{
-                s3_subState := sub_state.s_1
-              }
-            }
+      when(sValid(i) && !sReqIssued(i)){
+        want := True
+        isWrite := False
+        switch(i){
+          is(0) {
+            addr := sReg(0).src
           }
-          is(sub_state.s_1){
-            io.LocalMMUIO.Request.valid := True
-            io.LocalMMUIO.Request.payload.RequestVirtualAddr := HumongousReclaimCandidatesBoolBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-            io.LocalMMUIO.Request.payload.RequestType_isWrite := True
-            io.LocalMMUIO.Request.payload.RequestData := 0 // 只写1字节
-            io.LocalMMUIO.Response.ready := True
-            when(io.LocalMMUIO.Response.fire) {
-              io.LocalMMUIO.Request.valid := False
-              s3_subState := sub_state.s_2
-            }
+          is(1) {
+            addr := RegionAttrBiasedBase + (sReg(1).obj >> RegionAttrShiftBy) * GCHeapRegionAttr_Size
           }
-          is(sub_state.s_2){
-            io.LocalMMUIO.Request.valid := True
-            io.LocalMMUIO.Request.payload.RequestVirtualAddr := RegionAttrBase + ((s3Reg.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes) * GCHeapRegionAttr_Size
-            io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-            io.LocalMMUIO.Request.payload.RequestType_isWrite := True
-            io.LocalMMUIO.Request.payload.RequestData := U(Type_NoInCset) // 只写1字节
-            io.LocalMMUIO.Response.ready := True
-            when(io.LocalMMUIO.Response.fire) {
-              io.LocalMMUIO.Request.valid := False
-              s3_subState := sub_state.s_0
-              s4Valid := True
-              s4Reg := s3Reg
-              s3Valid := False
-            }
+          is(3) {
+            addr := HumongousReclaimCandidatesBoolBase + ((sReg(3).obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
+          }
+          is(4) {
+            addr := HumongousReclaimCandidatesBoolBase + ((sReg(4).obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes)
+            isWrite := True
+            wdata := U(0)
+            wmask := U(1)
+          }
+          is(5) {
+            addr :=  RegionAttrBase + ((sReg(5).obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes) * GCHeapRegionAttr_Size + TypeOffSet
+            isWrite := True
+            wdata := U(Type_NoInCset)
+            wmask := U(1)
+          }
+          is(6) {
+            addr := ParScanThreadStatePtr + OBJCLOSURE_OFFSET + SCANNING_IN_YOUNG_OFFSET
+          }
+          default{
+            want := False
           }
         }
-      }.otherwise{
-        s4Valid := True
-        s4Reg := s3Reg
-        s3Valid := False
+      }
+      when(want){
+        io.TraceMMUIO.oopWorkMReqs(i).Request.valid := True
+        io.TraceMMUIO.oopWorkMReqs(i).Request.payload.RequestVirtualAddr := addr
+        io.TraceMMUIO.oopWorkMReqs(i).Request.payload.RequestType_isWrite := isWrite
+        io.TraceMMUIO.oopWorkMReqs(i).Request.payload.RequestWStrb := wmask
+        io.TraceMMUIO.oopWorkMReqs(i).Request.payload.RequestData := wdata
+        io.TraceMMUIO.oopWorkMReqs(i).Request.payload.RequestSourceID := io.TraceMMUIO.oopWorkMReqs(i).ConherentRequsetSourceID.payload
+        io.TraceMMUIO.oopWorkMReqs(i).Response.ready := True
+        when(io.TraceMMUIO.oopWorkMReqs(i).Request.fire){
+          sReqIssued(i) := True
+        }
       }
     }
+
+    // Response fire
+    for(i <- 0 until oopWorkStages - 1){
+      when(io.TraceMMUIO.oopWorkMReqs(i).Response.fire && sValid(i)) {
+        val data = io.TraceMMUIO.oopWorkMReqs(i).Response.payload.ResponseData
+        sReqIssued(i) := False
+        sReg(i + 1) := sReg(i)
+        switch(i) {
+          is(0) {
+            when(data =/= U(0) && !sValid(1)) {
+              sValid(0) := False
+              sValid(1) := True
+              sReg(1).obj := data
+            }
+          }
+          is(1) {
+            when(!(data(7 downto 0).asSInt < Type_Young && (sReg(1).dest ^ sReg(1).obj) >> LogOfHRGrainBytes === 0) && !sValid(2)) {
+              sValid(1) := False
+              sValid(2) := True
+              sReg(2).regionAttr := data(15 downto 0)
+            }
+          }
+          is(3) {
+            when(data(0) && !sValid(4)) {
+              sValid(3) := False
+              sValid(4) := True
+            }.elsewhen(!data(0) && !sValid(6)) {
+              sValid(3) := False
+              sValid(6) := True
+              sReg(6) := sReg(3)
+            }
+          }
+          is(6) {
+            when(data(7 downto 0) =/= U(1) && sReg(6).regionAttr(7 downto 0) === U(1) && !sValid(7)) {
+              sValid(6) := False
+              sValid(7) := True
+            }
+          }
+
+          default {
+            when(!sValid(i + 1)){
+              sValid(i) := False
+              sValid(i + 1) := True
+              sReg(i + 1) := sReg(i)
+            }
+          }
+        }
+      }.elsewhen(U(i) === U(2) && sValid(2)){
+          when(sReg(2).regionAttr(15 downto 8).asSInt >= Type_Young) {
+            io.Trace2Stack.valid := True
+            io.Trace2Stack.payload := sReg(2).dest
+            when(io.Trace2Stack.fire) {
+              sValid(2) := False
+            }
+          }.elsewhen(sReg(2).regionAttr(15 downto 8).asSInt === Type_Humongous && !sValid(3)){
+            sValid(2) := False
+            sValid(3) := True
+            sReg(3) := sReg(2)
+          }.elsewhen(!sValid(6)){
+            sValid(2) := False
+            sValid(6) := True
+            sReg(6) := sReg(2)
+          }
+      }.elsewhen(sValid(7) && U(i) === 7){
+        // send GCAop
+        io.Trace2Aop.Valid := True
+        io.Trace2Aop.ParScanThreadStatePtr := ParScanThreadStatePtr
+        io.Trace2Aop.DestOopPtr := sReg(7).dest
+        when(io.Trace2Aop.Valid && io.Trace2Aop.Ready){
+          sValid(7) := False
+        }
+      }
+    }
+    val done = traceTaskFifo.io.occupancy === U(0) && !sValid.orR && io.Trace2Aop.Done
   }
 
+  val p = RegInit(U(0, IntWidth bits))
+  val q = RegInit(U(0, IntWidth bits))
   val arrayTrace_subState = RegInit(sub_state.s_0)
   when(state === overall_state.s_arrayTrace){
-    prev_state := overall_state.s_arrayTrace
     switch(arrayTrace_subState){
       is(sub_state.s_0){
         //assign p, q and prev_state
@@ -298,15 +325,11 @@ class GCTrace extends Module with GCParameters with HWParameters{
       }
       is(sub_state.s_1){
         when(p < q){
-          traceTaskFifo.io.push.valid := True
-          traceTaskFifo.io.push.payload.src := p - DestOopPtr + SrcOopPtr
-          traceTaskFifo.io.push.payload.dest := p
-          when(traceTaskFifo.io.push.fire){
-            traceTaskFifo.io.push.valid := False
+          when(pushFifo(p - DestOopPtr + SrcOopPtr, p)){
             p := p + GCObjectPtr_Size
           }
         }.otherwise{
-          when(traceTaskFifo.io.occupancy === 0 && doOopWork.done){
+          when(doOopWork.done){
             arrayTrace_subState := sub_state.s_0
             state := overall_state.s_end
           }
@@ -317,25 +340,24 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   val refTrace_subState = RegInit(sub_state.s_0)
   when(state === overall_state.s_refKlassTrace){
-    prev_state := overall_state.s_refKlassTrace
     switch(refTrace_subState){
       is(sub_state.s_0){
         // do_oop_work(DISCOVERED)
-        p := DestOopPtr + DISCOVERED_OFFSET
-        state := overall_state.s_doOopWork
-        refTrace_subState := sub_state.s_1
+        when(pushFifo(SrcOopPtr + DISCOVERED_OFFSET, DestOopPtr + DISCOVERED_OFFSET)){
+          refTrace_subState := sub_state.s_1
+        }
       }
       is(sub_state.s_1){
         // do_oop_work(DISCOVERED)
-        p := DestOopPtr + REFERENT_OFFSET
-        state := overall_state.s_doOopWork
-        refTrace_subState := sub_state.s_2
+        when(pushFifo(SrcOopPtr + REFERENT_OFFSET, DestOopPtr + REFERENT_OFFSET)){
+          refTrace_subState := sub_state.s_2
+        }
       }
       is(sub_state.s_2){
         // do_oop_work(DISCOVERED)
-        p := DestOopPtr + DISCOVERED_OFFSET
-        state := overall_state.s_doOopWork
-        refTrace_subState := sub_state.s_3
+        when(pushFifo(SrcOopPtr + DISCOVERED_OFFSET, DestOopPtr + DISCOVERED_OFFSET)){
+          refTrace_subState := sub_state.s_3
+        }
       }
       is(sub_state.s_3){
         state := overall_state.s_oopTrace
@@ -346,25 +368,22 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   val staticTrace_subState = RegInit(sub_state.s_0)
   when(state === overall_state.s_staticTrace){
-    prev_state := overall_state.s_staticTrace
     switch(staticTrace_subState){
       is(sub_state.s_0){
         //access (SrcOopPtr + staticOopFieldOff)
-        io.LocalMMUIO.Request.valid := True
-        io.LocalMMUIO.Request.payload.RequestVirtualAddr := SrcOopPtr + staticOopFieldCountOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-        io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-        io.LocalMMUIO.Response.ready := True
-        when(io.LocalMMUIO.Response.fire){
+        val addr = SrcOopPtr + staticOopFieldCountOff
+        val staticReqIssue = RegInit(False)
+        issueReq(io.TraceMMUIO.staticMReq, addr, False, U(0), U(0), staticReqIssue) {rd =>
           p := SrcOopPtr + StaticFieldOff
-          q := SrcOopPtr + StaticFieldOff + io.LocalMMUIO.Response.payload.ResponseData(31 downto 0) * GCObjectPtr_Size
+          q := SrcOopPtr + StaticFieldOff + rd(31 downto 0) * GCObjectPtr_Size
           staticTrace_subState := sub_state.s_1
-          io.LocalMMUIO.Request.valid := False
         }
       }
       is(sub_state.s_1){
         when(p < q){
-          state := overall_state.s_doOopWork
+          when(pushFifo(p - DestOopPtr + SrcOopPtr, p)){
+            p := p + GCObjectPtr_Size
+          }
         }.otherwise{
           state := overall_state.s_oopTrace
           staticTrace_subState := sub_state.s_0
@@ -380,61 +399,43 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   val start_map = RegInit(U(0, MMUAddrWidth bits))
   val end_map = RegInit(U(0, MMUAddrWidth bits))
+  val oopReq = Vec(RegInit(False), 4)
   when(state === overall_state.s_oopTrace){
-    prev_state := overall_state.s_oopTrace
     switch(oopTrace_subState){
       is(sub_state.s_0){
         // access (KlassPtr + VTableLenOff) to get the vtableLen
-        io.LocalMMUIO.Request.valid := True
-        io.LocalMMUIO.Request.payload.RequestVirtualAddr := KlassPtr + VTableLenOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-        io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-        io.LocalMMUIO.Response.ready := True
-        when(io.LocalMMUIO.Response.fire){
-          vtable_len := io.LocalMMUIO.Response.payload.ResponseData(31 downto 0)
+        val addr = KlassPtr + VTableLenOff
+        issueReq(io.TraceMMUIO.oopTraceMReqs(0), addr, False, U(0), U(0), oopReq(0)) {rd =>
+          vtable_len := rd(31 downto 0)
           oopTrace_subState := sub_state.s_1
-          io.LocalMMUIO.Request.valid := False
         }
       }
       is(sub_state.s_1){
         // access (KlassPtr + NonStaticOopMapSizeOff) to get the itableLen and nonStaticOopMapSize
-        io.LocalMMUIO.Request.valid := True
-        io.LocalMMUIO.Request.payload.RequestVirtualAddr := KlassPtr + ITableLenOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-        io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-        io.LocalMMUIO.Response.ready := True
-        when(io.LocalMMUIO.Response.fire){
-          nonstaticOopMapSize := io.LocalMMUIO.Response.payload.ResponseData(31 downto 0)
-          itable_len := io.LocalMMUIO.Response.payload.ResponseData(63 downto 32)
+        val addr = KlassPtr + ITableLenOff
+        issueReq(io.TraceMMUIO.oopTraceMReqs(1), addr, False, U(0), U(0), oopReq(1)) {rd =>
+          nonstaticOopMapSize := rd(31 downto 0)
+          itable_len := rd(63 downto 32)
           oopTrace_subState := sub_state.s_2
-          io.LocalMMUIO.Request.valid := False
         }
       }
       is(sub_state.s_2){
-        io.LocalMMUIO.Request.valid := True
-        io.LocalMMUIO.Request.payload.RequestVirtualAddr := KlassPtr + VTableOff
-        io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-        io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-        io.LocalMMUIO.Response.ready := True
-        when(io.LocalMMUIO.Response.fire){
-          start_map := io.LocalMMUIO.Response.payload.ResponseData + vtable_len + itable_len
-          end_map := io.LocalMMUIO.Response.payload.ResponseData + vtable_len + itable_len + nonstaticOopMapSize * GCObjectPtr_Size
+        // access (KlassPtr + VTableOff)
+        val addr = KlassPtr + VTableOff
+        issueReq(io.TraceMMUIO.oopTraceMReqs(2), addr, False, U(0), U(0), oopReq(2)) {rd =>
+          start_map := rd + vtable_len + itable_len
+          end_map := rd + vtable_len + itable_len + nonstaticOopMapSize * GCObjectPtr_Size
           oopTrace_subState := sub_state.s_3
-          io.LocalMMUIO.Request.valid := False
         }
       }
       is(sub_state.s_3){
         when(start_map < end_map){
-          io.LocalMMUIO.Request.valid := True
-          io.LocalMMUIO.Request.payload.RequestVirtualAddr := end_map - GCObjectPtr_Size
-          io.LocalMMUIO.Request.payload.RequestSourceID := io.LocalMMUIO.ConherentRequsetSourceID.payload
-          io.LocalMMUIO.Request.payload.RequestType_isWrite := False
-          io.LocalMMUIO.Response.ready := True
-          when(io.LocalMMUIO.Response.fire){
-            p := DestOopPtr + io.LocalMMUIO.Response.payload.ResponseData(31 downto 0)
-            q := DestOopPtr + io.LocalMMUIO.Response.payload.ResponseData(31 downto 0) + io.LocalMMUIO.Response.payload.ResponseData(63 downto 32) * GCObjectPtr_Size - GCObjectPtr_Size
+          // access p and q
+          val addr = end_map - GCObjectPtr_Size
+          issueReq(io.TraceMMUIO.oopTraceMReqs(3), addr, False, U(0), U(0), oopReq(2)) {rd =>
+            p := DestOopPtr + rd(31 downto 0)
+            q := DestOopPtr + rd(31 downto 0) + rd(63 downto 32) * GCObjectPtr_Size - GCObjectPtr_Size
             oopTrace_subState := sub_state.s_4
-            io.LocalMMUIO.Request.valid := False
           }
         }.otherwise{
           oopTrace_subState := sub_state.s_0
@@ -444,7 +445,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
       }
       is(sub_state.s_4) {
         when(p < q + GCObjectPtr_Size) {
-          state := overall_state.s_doOopWork
+          when(pushFifo(q - DestOopPtr + SrcOopPtr, q)){
+            q := q - GCObjectPtr_Size
+          }
         }.otherwise {
           oopTrace_subState := sub_state.s_3
           end_map := end_map - GCObjectPtr_Size
@@ -456,5 +459,4 @@ class GCTrace extends Module with GCParameters with HWParameters{
   when(state === overall_state.s_end){
     state := overall_state.s_idle
   }
-
 }
