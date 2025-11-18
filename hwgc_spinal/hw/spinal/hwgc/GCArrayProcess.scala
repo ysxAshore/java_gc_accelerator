@@ -1,0 +1,5 @@
+package hwgc
+
+class GCArrayProcess {
+
+}

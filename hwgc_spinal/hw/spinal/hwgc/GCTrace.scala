@@ -367,12 +367,12 @@ class GCTrace(oopWorkStages:Int) extends Module with GCParameters with HWParamet
   }
 
   val staticTrace_subState = RegInit(sub_state.s_0)
+  val staticReqIssue = RegInit(False)
   when(state === overall_state.s_staticTrace){
     switch(staticTrace_subState){
       is(sub_state.s_0){
         //access (SrcOopPtr + staticOopFieldOff)
         val addr = SrcOopPtr + staticOopFieldCountOff
-        val staticReqIssue = RegInit(False)
         issueReq(io.TraceMMUIO.staticMReq, addr, False, U(0), U(0), staticReqIssue) {rd =>
           p := SrcOopPtr + StaticFieldOff
           q := SrcOopPtr + StaticFieldOff + rd(31 downto 0) * GCObjectPtr_Size
