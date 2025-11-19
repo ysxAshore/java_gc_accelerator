@@ -8,6 +8,8 @@ trait GCParameters {
   val GCTaskStack_Entry = 64
   val GCTaskStack_SpillNeed = 63
   val GCTaskStack_ReadNeed = 8
+  val GCoopWorkStages = 8
+  val GCaopWorkStages = 10
 
   /* ----------------- ScannerTask Tag ----------------- */
   val OopTag = 0
@@ -144,18 +146,28 @@ class ProcessUnit extends Bundle with HWParameters with GCParameters with IMaste
 
   val Done = out Bool()
 
+  val RegionAttrBase = in UInt(MMUAddrWidth bits)
+  val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
+  val RegionAttrShiftBy = in UInt(IntWidth bits)
+  val HeapRegionBias = in UInt(IntWidth bits)
+  val HeapRegionShiftBy = in UInt(IntWidth bits)
+  val HumongousReclaimCandidatesBoolBase = in UInt(MMUAddrWidth bits)
+  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
+
   val OopType = in UInt(GCOopTypeWidth bits)
   val SrcOopPtr = in UInt(MMUAddrWidth bits)
+  val MarkWord = in UInt(MMUDataWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
-    out(Valid, OopType, SrcOopPtr)
+    out(Valid, OopType, SrcOopPtr, RegionAttrBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr)
   }
 }
 
-class GCParse2Trace extends Bundle with HWParameters with GCParameters with IMasterSlave{
+class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
+  val Done = out Bool()
   // some config parameters
   val RegionAttrBase = in UInt(MMUAddrWidth bits)
   val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
@@ -178,7 +190,7 @@ class GCParse2Trace extends Bundle with HWParameters with GCParameters with IMas
 
   override def asMaster(): Unit = {
     in(Valid, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr, OopType, KlassPtr, SrcOopPtr, DestOopPtr, Kid, ArrayLength, PartialArrayStart, StepIndex, StepNCreate)
-    out(Ready)
+    out(Ready, Done)
   }
 }
 

@@ -24,7 +24,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   io.FetchMReq.Response.ready := False
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_loadMem, s_send, s_waitDone, s_end = newElement()
+    val s_idle, s_readOop, s_readMW, s_send, s_waitDone = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
@@ -34,7 +34,6 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // mem related regs
   val issued = RegInit(False)
-  val memDone = RegInit(False)
   val memData = RegInit(U(0, MMUAddrWidth bits))
 
   // idle: take task from stack
@@ -43,75 +42,68 @@ class GCFetch extends Module with HWParameters with GCParameters {
     when(io.Stack2Fetch.fire){
       val payload = io.Stack2Fetch.payload
       when(payload(GCOopTypeWidth - 1 downto 0) === U(OopTag)){
-        oopType := OopTag
-        task := payload - OopTag
+        oopType := U(OopTag)
+        task := payload - U(OopTag)
       }.otherwise{
-        oopType := PartialArrayTag
-        task := payload - PartialArrayTag
+        oopType := U(PartialArrayTag)
+        task := payload - U(PartialArrayTag)
       }
 
       // reset mem flags for next task
       issued := False
-      memDone := False
       memData := U(0)
 
       state := overall_state.s_loadMem
     }
   }
 
-  // loadMem: oopTag -> send mreq
-  when(state === overall_state.s_loadMem){
-    when(oopType === OopTag){
+  // readOop: oopTag -> send mreq
+  when(state === overall_state.s_readOop){
+    when(oopType === U(OopTag)){
      issueReq(io.FetchMReq, task, False, U(0), U(0), issued){ rd =>
        memData := rd
-       memDone := True
+       state := overall_state.s_readMW
      }
-
-      when(memDone) {
-        state := overall_state.s_send
-      }
     }.otherwise{
       memData := task
-      memDone := True
+      state := overall_state.s_readMW
+    }
+  }
+
+  val markWord = RegInit(U(0, MMUDataWidth bits))
+  when(state === overall_state.s_readMW){
+    issueReq(io.FetchMReq, memData + MarkWordOff, False, U(0), U(0), issued){ rd =>
+      markWord := rd
       state := overall_state.s_send
     }
   }
 
+
   // send
   when(state === overall_state.s_send){
-    when(oopType === OopTag){
-      io.Fetch2OopProcess.SrcOopPtr := memData
-      io.Fetch2OopProcess.OopType := oopType
-      io.Fetch2OopProcess.Valid := True
+    val processUnit = Mux(oopType === U(OopTag), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
+    processUnit.Valid := True
 
-      when(io.Fetch2OopProcess.Valid && io.Fetch2OopProcess.Ready){
-        state := overall_state.s_waitDone
-      }
-    }.otherwise{
-      io.Fetch2ArrayProcess.SrcOopPtr := memData
-      io.Fetch2ArrayProcess.OopType := oopType
-      io.Fetch2ArrayProcess.Valid := True
+    processUnit.OopType := oopType
+    processUnit.SrcOopPtr := memData
+    processUnit.MarkWord := markWord
 
-      when(io.Fetch2ArrayProcess.Valid && io.Fetch2ArrayProcess.Ready){
-        state := overall_state.s_waitDone
-      }
+    when(processUnit.Valid && processUnit.Ready){
+      state := overall_state.s_waitDone
     }
   }
 
   // waitDone
   when(state === overall_state.s_waitDone){
-    when(oopType === OopTag){
+    when(oopType === U(OopTag)){
       when(io.Fetch2OopProcess.Done){
-        state := overall_state.s_end
+        state := overall_state.s_idle
       }
     }.otherwise{
       when(io.Fetch2ArrayProcess.Done){
-        state := overall_state.s_end
+        state := overall_state.s_idle
       }
     }
   }
 
-  when(state === overall_state.s_end){
-    state := overall_state.s_idle
-  }
 }
