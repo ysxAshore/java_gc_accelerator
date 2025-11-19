@@ -95,15 +95,9 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // waitDone
   when(state === overall_state.s_waitDone){
-    when(oopType === U(OopTag)){
-      when(io.Fetch2OopProcess.Done){
-        state := overall_state.s_idle
-      }
-    }.otherwise{
-      when(io.Fetch2ArrayProcess.Done){
-        state := overall_state.s_idle
-      }
+    val processUnit = Mux(oopType === U(OopTag), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
+    when(processUnit.Done){
+      state := overall_state.s_idle
     }
   }
-
 }

@@ -24,6 +24,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     val ToTrace = slave(new GCProcess2Trace)
     val Trace2Stack = master Stream UInt(MMUAddrWidth bits)
     val Trace2Aop = master(new AopParameters)
+    val ConfigIO = slave(new GCTraceConfigIO)
   }
 
   // default value
@@ -91,13 +92,13 @@ class GCTrace extends Module with GCParameters with HWParameters{
     when(io.ToTrace.Valid && io.ToTrace.Ready){
       io.ToTrace.Done := False
 
-      RegionAttrBase := io.ToTrace.RegionAttrBase
-      RegionAttrBiasedBase:= io.ToTrace.RegionAttrBiasedBase
-      RegionAttrShiftBy := io.ToTrace.RegionAttrShiftBy
-      HeapRegionBias := io.ToTrace.HeapRegionBias
-      HeapRegionShiftBy := io.ToTrace.HeapRegionShiftBy
-      HumongousReclaimCandidatesBoolBase := io.ToTrace.HumongousReclaimCandidatesBoolBase
-      ParScanThreadStatePtr := io.ToTrace.ParScanThreadStatePtr
+      RegionAttrBase := io.ConfigIO.RegionAttrBase
+      RegionAttrBiasedBase:= io.ConfigIO.RegionAttrBiasedBase
+      RegionAttrShiftBy := io.ConfigIO.RegionAttrShiftBy
+      HeapRegionBias := io.ConfigIO.HeapRegionBias
+      HeapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
+      HumongousReclaimCandidatesBoolBase := io.ConfigIO.HumongousReclaimCandidatesBoolBase
+      ParScanThreadStatePtr := io.ConfigIO.ParScanThreadStatePtr
       KlassPtr := io.ToTrace.KlassPtr
       SrcOopPtr := io.ToTrace.SrcOopPtr
       DestOopPtr := io.ToTrace.DestOopPtr
@@ -122,13 +123,13 @@ class GCTrace extends Module with GCParameters with HWParameters{
           report(Seq(
             "[GCTrace<", io.DebugInfo.DebugTimeStampe,
             ">] GCParse to GCTrace",
-            ", RegionAttrBase = ", io.ToTrace.RegionAttrBase,
-            ", RegionAttrBiasedBase = ", io.ToTrace.RegionAttrBiasedBase,
-            ", RegionAttrShiftBy = ", io.ToTrace.RegionAttrShiftBy,
-            ", HeapRegionBias = ", io.ToTrace.HeapRegionBias,
-            ", HeapRegionShiftBy = ", io.ToTrace.HeapRegionShiftBy,
-            ", HumongousReclaimCandidatesBoolBase = ", io.ToTrace.HumongousReclaimCandidatesBoolBase,
-            ", ParScanThreadStatePtr = ", io.ToTrace.ParScanThreadStatePtr,
+            ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase,
+            ", RegionAttrBiasedBase = ", io.ConfigIO.RegionAttrBiasedBase,
+            ", RegionAttrShiftBy = ", io.ConfigIO.RegionAttrShiftBy,
+            ", HeapRegionBias = ", io.ConfigIO.HeapRegionBias,
+            ", HeapRegionShiftBy = ", io.ConfigIO.HeapRegionShiftBy,
+            ", HumongousReclaimCandidatesBoolBase = ", io.ConfigIO.HumongousReclaimCandidatesBoolBase,
+            ", ParScanThreadStatePtr = ", io.ConfigIO.ParScanThreadStatePtr,
             ", OopType = ", io.ToTrace.OopType,
             ", KlassPtr = ", io.ToTrace.KlassPtr,
             ", SrcOopPtr = ", io.ToTrace.SrcOopPtr,
