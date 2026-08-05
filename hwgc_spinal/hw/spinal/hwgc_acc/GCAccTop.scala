@@ -298,7 +298,7 @@ class GCAccTop extends Module with GCTopParameters {
     gcArrayProcess.io.Process2Trace.cmd,      // source 0
     gcOopCopy2Survivor.io.ToTrace.cmd         // source 1
   )
-  val traceArb = StreamArbiterFactory().roundRobin.buildOn(traceInputs)
+  val traceArb = StreamArbiterFactory().roundRobin.transactionLock.buildOn(traceInputs)
   val traceOwner = Reg(UInt(1 bits)) init(0)
 
   gcTrace.io.ToTrace.cmd << traceArb.io.output
@@ -327,7 +327,7 @@ class GCAccTop extends Module with GCTopParameters {
     gcOopProcess.io.Process2Aop.cmd,        // source 0
     gcTrace.io.ToAop.cmd,                   // source 1
   )
-  val aopArb = StreamArbiterFactory().roundRobin.buildOn(aopInputs)
+  val aopArb = StreamArbiterFactory().roundRobin.transactionLock.buildOn(aopInputs)
   val aopOwner = Reg(UInt(1 bits)) init(0)
 
   gcAop.io.Aop.cmd << aopArb.io.output
