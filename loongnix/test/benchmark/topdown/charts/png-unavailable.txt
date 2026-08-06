@@ -1,0 +1,1 @@
+PNG outputs were not generated. install cairosvg to render the SVGs to PNG; SVG files remain the canonical outputs.
