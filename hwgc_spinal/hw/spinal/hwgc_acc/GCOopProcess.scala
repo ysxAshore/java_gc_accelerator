@@ -18,9 +18,10 @@ case class SlotCtx() extends Bundle with GCTopParameters {
   val destOopPtr           = UInt(GCElementWidth bits)
   val heapRegion           = UInt(GCElementWidth bits)
   val heapRegionHumongous  = Bool()
+  val heapRegionReady      = Bool()
+  val heapLookupPhase      = UInt(1 bits) // 0: heap-region ptr, 1: humongous flag
 
   val fromMarkWord         = Bool()
-  val accessDestRegionAttr = Bool()
   val destRegionAttr       = UInt(16 bits)
 }
 
@@ -76,16 +77,14 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     )
   }
 
-  val slotStart           = Vec.fill(2)(Bool())
-  val slotGotoIdle        = Vec.fill(2)(Bool())
-  val slotCopyReqAccepted = Vec.fill(2)(Bool())
-  val slotReleaseFetch    = Vec.fill(2)(Bool()) // 当前Slot 允许前级 Fetch 释放任务
+  val slotStart        = Vec.fill(2)(Bool())
+  val slotGotoIdle     = Vec.fill(2)(Bool())
+  val slotReleaseFetch = Vec.fill(2)(Bool()) // 当前Slot 允许前级 Fetch 释放任务
   // 这个默认赋值放条件赋值前面 不然会 和条件 冲突 ASSIGN OVERFLEAP
   for (i <- 0 until 2) {
-    slotStart(i)           := False
-    slotGotoIdle(i)        := False
-    slotCopyReqAccepted(i) := False
-    slotReleaseFetch(i)    := False
+    slotStart(i)        := False
+    slotGotoIdle(i)     := False
+    slotReleaseFetch(i) := False
   }
 
 
@@ -108,13 +107,15 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     slotCtx(i).destOopPtr           := 0
     slotCtx(i).heapRegion           := 0
     slotCtx(i).heapRegionHumongous  := False
+    slotCtx(i).heapRegionReady      := False
+    slotCtx(i).heapLookupPhase      := 0
     slotCtx(i).fromMarkWord         := False
-    slotCtx(i).accessDestRegionAttr := False
     slotCtx(i).destRegionAttr       := 0
 
     slotCopy2SurvivorDone(i)          := False
     slotCopy2SurvivorInflight(i)      := False
     slotCopy2SurvivorBypassGranted(i) := False
+    slotNeedCopyReq(i)                := False
   }
   def allocToSlot(i: Int): Unit = {
     val allocFwdHit = incomingFwdValid && io.Fetch2Process.cmd.payload.SrcOopPtr === incomingFwdObj
@@ -169,8 +170,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val srcRegionAttrAddr     = Vec.fill(2)(UInt(MMUAddrWidth bits))
   val destRegionAttrAddr    = Vec.fill(2)(UInt(MMUAddrWidth bits))
   val heapRegionLookupAddr  = Vec.fill(2)(UInt(MMUAddrWidth bits))
-  val srcRegionAttrHit      = Vec.fill(2)(Bool())
-  val srcRegionAttrHitIndex = Vec.fill(2)(UInt(log2Up(regionAttrCacheEntries) bits))
+  val srcRegionAttrHit       = Vec.fill(2)(Bool())
+  val srcRegionAttrHitIndex  = Vec.fill(2)(UInt(log2Up(regionAttrCacheEntries) bits))
+  val destRegionAttrHit      = Vec.fill(2)(Bool())
+  val destRegionAttrHitIndex = Vec.fill(2)(UInt(log2Up(regionAttrCacheEntries) bits))
 
   val heapRegionHit         = Vec.fill(2)(Bool())
   val heapRegionHitIndex    = Vec.fill(2)(UInt(log2Up(heapRegionCacheEntries) bits))
@@ -180,13 +183,17 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     destRegionAttrAddr(i)   := destRegionAttrAddrOf(i)
     heapRegionLookupAddr(i) := heapRegionLookupAddrOf(i)
 
-    val regionHitVec = Vec.fill(regionAttrCacheEntries)(Bool())
+    val srcRegionHitVec = Vec.fill(regionAttrCacheEntries)(Bool())
+    val destRegionHitVec = Vec.fill(regionAttrCacheEntries)(Bool())
     for (j <- 0 until regionAttrCacheEntries) {
-      regionHitVec(j) := regionAttrCacheValid(j) && regionAttrCacheTag(j) === srcRegionAttrAddr(i)
+      srcRegionHitVec(j)  := regionAttrCacheValid(j) && regionAttrCacheTag(j) === srcRegionAttrAddr(i)
+      destRegionHitVec(j) := regionAttrCacheValid(j) && regionAttrCacheTag(j) === destRegionAttrAddr(i)
     }
 
-    srcRegionAttrHit(i)      := regionHitVec.orR
-    srcRegionAttrHitIndex(i) := OHToUInt(regionHitVec.asBits)
+    srcRegionAttrHit(i)       := srcRegionHitVec.orR
+    srcRegionAttrHitIndex(i)  := OHToUInt(srcRegionHitVec.asBits)
+    destRegionAttrHit(i)      := destRegionHitVec.orR
+    destRegionAttrHitIndex(i) := OHToUInt(destRegionHitVec.asBits)
 
     val heapHitVec = Vec.fill(heapRegionCacheEntries)(Bool())
     for (j <- 0 until heapRegionCacheEntries) {
@@ -215,9 +222,11 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     heapRegionFillData(i)  := False
   }
 
-  val slotCopy2SurvivorDone          = Vec.fill(2)(RegInit(False)) // CopySurvivor 已经返回 最终的 destOopPtr
+    val slotCopy2SurvivorDone          = Vec.fill(2)(RegInit(False)) // CopySurvivor 已经返回 最终的 destOopPtr
   val slotCopy2SurvivorInflight      = Vec.fill(2)(RegInit(False)) // 已经向 CopySurvivor 发出请求，正在等待返回
   val slotCopy2SurvivorBypassGranted = Vec.fill(2)(RegInit(False)) // 某些 type array 可以提前释放 Fetch，避免阻塞前级
+  // Copy2Survivor 请求还未 fire。该请求与 heap-region 查询并行。
+  val slotNeedCopyReq                = Vec.fill(2)(RegInit(False))
 
   // allowSecondInFlight = True 表示已经有某个 slot 提前对 Fetch 发过 Done， 因此允许 Fetch 再送一个任务进入另一个空 slot
   val allowSecondInFlight = RegInit(False)
@@ -285,7 +294,6 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   }
 
   // slot FSM visibility for shared-output arbitration
-  val slotIsCopyReq = Vec.fill(2)(Bool())
   val slotIsWaitAop = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
@@ -294,14 +302,81 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     val slotFsm = new MyStateMachine {
       val IDLE              = new State with EntryPoint
       val READ_SRC_ATTR     = new State
-      val DECIDE            = new State
-      val COPY_SURV_REQ     = new State
-      val READ_HEAP_PTR     = new State
-      val READ_HUMONGOUS    = new State
-      val WAIT_COPY_OR_MARK = new State
+      // heap ptr / humongous / wait-copy 三段合成一个 phase-based join state。
+      val RESOLVE_HEAP_COPY = new State
       val WRITE_BACK        = new State
       val READ_DEST_ATTR    = new State
       val SEND_AOP          = new State
+
+      def resolveSrcRegionAttr(attr: UInt): Unit = {
+        slotCtx(i).srcRegionAttr := attr
+
+        val srcRegionAttrType = attr(15 downto 8).asSInt
+        when(srcRegionAttrType < S(0, 8 bits)) {
+          releaseFetchFromSlotDyn(U(i, 1 bits))
+          finishSlot(i)
+
+        } otherwise {
+          val currentMarkWord = slotEffectiveMarkWord(i)
+
+          when(isForwardedMark(currentMarkWord)) {
+            slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
+            slotCtx(i).fromMarkWord := True
+
+            releaseFetchFromSlotDyn(U(i, 1 bits))
+            goto(WRITE_BACK)
+
+            dbg(Seq("slot", i.toString, " use fromMarkWord path"))
+
+          } otherwise {
+            slotCtx(i).fromMarkWord := False
+            slotNeedCopyReq(i)      := True
+            slotCtx(i).heapRegionReady := False
+            slotCtx(i).heapLookupPhase := U(0)
+
+            // Copy2Survivor 请求与 heap-region 查询没有数据依赖，直接并行。
+            goto(RESOLVE_HEAP_COPY)
+
+            dbg(Seq("slot", i.toString, " start copy2survivor and heap lookup in parallel"))
+          }
+        }
+      }
+
+      def gotoDestAttrOrAop(): Unit = {
+        when(destRegionAttrHit(i)) {
+          slotCtx(i).destRegionAttr := regionAttrCache(destRegionAttrHitIndex(i))
+          goto(SEND_AOP)
+        } otherwise {
+          goto(READ_DEST_ATTR)
+        }
+      }
+
+      def joinHeapAndCopy(hum: Bool): Unit = {
+        slotCtx(i).heapRegionHumongous := hum
+        slotCtx(i).heapRegionReady := True
+
+        when(slotCtx(i).fromMarkWord && !slotCopy2SurvivorInflight(i) && !slotNeedCopyReq(i)) {
+          // late forwarding 或 forwarded-mark 路径：heap 信息一到即可继续。
+          slotCtx(i).fromMarkWord := False
+
+          when(hum) {
+            finishSlot(i)
+          } otherwise {
+            gotoDestAttrOrAop()
+          }
+
+        }.elsewhen(slotCopy2SurvivorDone(i)) {
+          val needRelease = !slotCopy2SurvivorBypassGranted(i)
+
+          when(needRelease) {
+            releaseFetchFromSlotDyn(U(i, 1 bits))
+          }
+
+          slotCopy2SurvivorDone(i) := False
+          slotCopy2SurvivorBypassGranted(i) := False
+          goto(WRITE_BACK)
+        }
+      }
 
       always {
         when(slotGotoIdle(i)) {
@@ -310,134 +385,71 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         }.elsewhen(slotStart(i)) {
           goto(READ_SRC_ATTR)
 
-        }.elsewhen(slotCopyReqAccepted(i)) {
-          goto(READ_HEAP_PTR)
+        }.elsewhen(
+          slotNeedCopyReq(i) &&
+          !slotCopy2SurvivorInflight(i) &&
+          isForwardedMark(slotEffectiveMarkWord(i))
+        ) {
+          // Copy2Survivor.cmd 还没有 fire 时如果收到 forwarding pointer：
+          // 取消 pending copy。heap lookup 可能已经在进行，不回退该内存访问。
+          slotNeedCopyReq(i)      := False
+          slotCtx(i).destOopPtr   := slotEffectiveMarkWord(i) & ~U(3, GCElementWidth bits)
+          slotCtx(i).fromMarkWord := True
+
+          releaseFetchFromSlotDyn(U(i, 1 bits))
+
+          dbg(Seq(
+            "slot", i.toString,
+            " receives late forwarding before Copy2Survivor fire, cancel pending copy"
+          ))
         }
       }
 
       READ_SRC_ATTR.whenIsActive {
         when(srcRegionAttrHit(i)) {
-          slotCtx(i).srcRegionAttr := regionAttrCache(srcRegionAttrHitIndex(i))
-          goto(DECIDE)
+          resolveSrcRegionAttr(regionAttrCache(srcRegionAttrHitIndex(i)))
 
         } otherwise {
-          issueDirectRead(m, srcRegionAttrAddr(i), U(2), DECIDE) { rd =>
-            slotCtx(i).srcRegionAttr := rd(15 downto 0)
+          // 直接在 read response 中完成 DECIDE，消掉一个纯控制状态。
+          issueReq(m, srcRegionAttrAddr(i), False, U(2), U(0), True, False, issued) { rd =>
+            val attr = rd(15 downto 0)
 
             regionAttrFillValid(i) := True
             regionAttrFillAddr(i)  := srcRegionAttrAddr(i)
-            regionAttrFillData(i)  := rd(15 downto 0)
+            regionAttrFillData(i)  := attr
+
+            resolveSrcRegionAttr(attr)
           }
         }
       }
 
-      DECIDE.whenIsActive {
-        val srcRegionAttrType = slotCtx(i).srcRegionAttr(15 downto 8).asSInt
+      RESOLVE_HEAP_COPY.whenIsActive {
+        when(slotCtx(i).heapRegionReady) {
+          // heap lookup 已完成，当前 state 直接作为 Copy/late-forwarding join point。
+          joinHeapAndCopy(slotCtx(i).heapRegionHumongous)
 
-        when(srcRegionAttrType < S(0, 8 bits)) {
-          releaseFetchFromSlotDyn(i)
-          finishSlot(i)
+        }.elsewhen(heapRegionHit(i)) {
+          // cache hit 不再经过额外 WAIT state。
+          joinHeapAndCopy(heapRegionCache(heapRegionHitIndex(i)))
 
-        } otherwise {
-          // 选择新的MarkWord
-          val currentMarkWord = slotEffectiveMarkWord(i)
-          val doCopy2Survivor = !isForwardedMark(currentMarkWord)
-
-          when(!doCopy2Survivor) { // 已经有 forwarding pointer，不再复制
-            slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
-            slotCtx(i).fromMarkWord := True
-
-            releaseFetchFromSlotDyn(i)
-
-            goto(WRITE_BACK)
-
-            dbg(Seq("slot", i.toString, " use fromMarkWord path"))
-
-          }.otherwise {
-            slotCtx(i).fromMarkWord := False
-
-            goto(COPY_SURV_REQ)
-
-            dbg(Seq("slot", i.toString, " go copy2survivor path"))
-          }
-        }
-      }
-
-      COPY_SURV_REQ.whenIsActive {
-        val currentMarkWord = slotEffectiveMarkWord(i)
-
-        // 任务已经进入 COPY_SURV_REQ，但还没有 cmd.fire 时，如果其他任务
-        // 已经安装 forwarding pointer，则取消本次复制，直接使用目标地址
-        when(isForwardedMark(currentMarkWord) && !slotCopy2SurvivorInflight(i)) {
-          slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
-          slotCtx(i).fromMarkWord := True
-
-          releaseFetchFromSlotDyn(i)
-          goto(WRITE_BACK)
-
-          dbg(Seq(
-            "slot", i.toString,
-            " receives late forwarding before Copy2Survivor fire, bypass copy"
-          ))
-        }
-      }
-
-      READ_HEAP_PTR.whenIsActive {
-        when(heapRegionHit(i)) {
-          slotCtx(i).heapRegionHumongous := heapRegionCache(heapRegionHitIndex(i))
-          when(slotCtx(i).fromMarkWord) {
-            slotCtx(i).fromMarkWord := False
-            when(heapRegionCache(heapRegionHitIndex(i))){ // 已经Release了 这里 Finish就可以
-              finishSlot(i)
-            }.otherwise{
-              slotCtx(i).accessDestRegionAttr := False
-              goto(READ_DEST_ATTR)
-            }
-          }.otherwise{ goto(WAIT_COPY_OR_MARK) }
-
-        } otherwise {
-          issueDirectRead(m, heapRegionLookupAddr(i), U(8), READ_HUMONGOUS) { rd =>
+        }.elsewhen(slotCtx(i).heapLookupPhase === U(0)) {
+          issueDirectRead(m, heapRegionLookupAddr(i), U(8), RESOLVE_HEAP_COPY) { rd =>
             slotCtx(i).heapRegion := rd(GCElementWidth - 1 downto 0)
-          }
-        }
-      }
-
-      READ_HUMONGOUS.whenIsActive {
-        val humAddr = (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
-
-        issueReq(m, humAddr, False, U(4), U(0), True, False, issued) { rd =>
-          val hum = (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
-
-          slotCtx(i).heapRegionHumongous := hum
-
-          heapRegionFillValid(i) := True
-          heapRegionFillAddr(i)  := heapRegionLookupAddr(i)
-          heapRegionFillData(i)  := hum
-
-          when(slotCtx(i).fromMarkWord) {
-            slotCtx(i).fromMarkWord := False
-            when(hum){
-              finishSlot(i)
-            }.otherwise{
-              slotCtx(i).accessDestRegionAttr := False
-              goto(READ_DEST_ATTR)
-            }
-          }.otherwise{ goto(WAIT_COPY_OR_MARK) }
-        }
-      }
-
-      WAIT_COPY_OR_MARK.whenIsActive {
-        when (slotCopy2SurvivorDone(i)) {
-          val needRelease = !slotCopy2SurvivorBypassGranted(i)
-
-          when(needRelease) { // 没有提前因为TypeArray Bypass release掉
-            releaseFetchFromSlotDyn(i)
+            slotCtx(i).heapLookupPhase := U(1)
           }
 
-          slotCopy2SurvivorDone(i) := False
-          slotCopy2SurvivorBypassGranted(i) := False
+        } otherwise {
+          val humAddr = (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
-          goto(WRITE_BACK)
+          issueReq(m, humAddr, False, U(4), U(0), True, False, issued) { rd =>
+            val hum = (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
+
+            heapRegionFillValid(i) := True
+            heapRegionFillAddr(i)  := heapRegionLookupAddr(i)
+            heapRegionFillData(i)  := hum
+
+            joinHeapAndCopy(hum)
+          }
         }
       }
 
@@ -453,7 +465,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
             when(sameRegion){
               finishSlot(i)
             }.otherwise{
-              goto(READ_HEAP_PTR)
+              // forwarded-mark 路径在 write-back 后才需要 heap 信息。
+              slotCtx(i).heapRegionReady := False
+              slotCtx(i).heapLookupPhase := U(0)
+              goto(RESOLVE_HEAP_COPY)
             }
 
           }.otherwise {
@@ -461,66 +476,120 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
               finishSlot(i)
 
             } otherwise {
-              slotCtx(i).accessDestRegionAttr := False
-              goto(READ_DEST_ATTR)
+              // destination attr cache hit 时直接去 AOP，省掉 READ_DEST_ATTR 状态周期。
+              gotoDestAttrOrAop()
             }
           }
         }
       }
 
       READ_DEST_ATTR.whenIsActive {
-        issueDirectRead(m, destRegionAttrAddr(i), U(2), SEND_AOP) { rd =>
-          slotCtx(i).accessDestRegionAttr := True
-          slotCtx(i).destRegionAttr       := rd(15 downto 0)
+        when(destRegionAttrHit(i)) {
+          slotCtx(i).destRegionAttr := regionAttrCache(destRegionAttrHitIndex(i))
+          goto(SEND_AOP)
+
+        } otherwise {
+          // 目的 region attr 与源 region attr 共用同一份 cache，避免重复 2-byte MMU read。
+          issueDirectRead(m, destRegionAttrAddr(i), U(2), SEND_AOP) { rd =>
+            slotCtx(i).destRegionAttr := rd(15 downto 0)
+
+            regionAttrFillValid(i) := True
+            regionAttrFillAddr(i)  := destRegionAttrAddr(i)
+            regionAttrFillData(i)  := rd(15 downto 0)
+          }
         }
       }
     }
 
-    slotIsCopyReq(i) := slotFsm.isActive(slotFsm.COPY_SURV_REQ)
     slotIsWaitAop(i) := slotFsm.isActive(slotFsm.SEND_AOP)
   }
 
-  // Shared regionAttrCache fill Fixed priority: slot0 > slot1
-  val grantRegionFill0 = regionAttrFillValid(0)
-  val grantRegionFill1 = !regionAttrFillValid(0) && regionAttrFillValid(1)
+  // Shared regionAttrCache fill
+  // Reg Vec 可以同周期写不同 entry，因此两个 slot 同周期返回时不再丢弃 slot1 fill。
+  when(regionAttrFillValid(0) && regionAttrFillValid(1)) {
+    when(regionAttrFillAddr(0) === regionAttrFillAddr(1)) {
+      regionAttrCacheValid(regionAttrCacheReplacePtr) := True
+      regionAttrCacheTag(regionAttrCacheReplacePtr)   := regionAttrFillAddr(0)
+      regionAttrCache(regionAttrCacheReplacePtr)      := regionAttrFillData(0)
+      regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + U(1)
 
-  when(grantRegionFill0 || grantRegionFill1) {
-    val fillAddr = Mux(grantRegionFill0, regionAttrFillAddr(0), regionAttrFillAddr(1))
-    val fillData = Mux(grantRegionFill0, regionAttrFillData(0), regionAttrFillData(1))
+    } otherwise {
+      val ptr0 = regionAttrCacheReplacePtr
+      val ptr1 = (regionAttrCacheReplacePtr + U(1)).resized
 
+      regionAttrCacheValid(ptr0) := True
+      regionAttrCacheTag(ptr0)   := regionAttrFillAddr(0)
+      regionAttrCache(ptr0)      := regionAttrFillData(0)
+
+      regionAttrCacheValid(ptr1) := True
+      regionAttrCacheTag(ptr1)   := regionAttrFillAddr(1)
+      regionAttrCache(ptr1)      := regionAttrFillData(1)
+
+      regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + U(2)
+    }
+
+  }.elsewhen(regionAttrFillValid(0)) {
     regionAttrCacheValid(regionAttrCacheReplacePtr) := True
-    regionAttrCacheTag(regionAttrCacheReplacePtr)   := fillAddr
-    regionAttrCache(regionAttrCacheReplacePtr)      := fillData
+    regionAttrCacheTag(regionAttrCacheReplacePtr)   := regionAttrFillAddr(0)
+    regionAttrCache(regionAttrCacheReplacePtr)      := regionAttrFillData(0)
+    regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + U(1)
 
-    regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + 1
+  }.elsewhen(regionAttrFillValid(1)) {
+    regionAttrCacheValid(regionAttrCacheReplacePtr) := True
+    regionAttrCacheTag(regionAttrCacheReplacePtr)   := regionAttrFillAddr(1)
+    regionAttrCache(regionAttrCacheReplacePtr)      := regionAttrFillData(1)
+    regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + U(1)
   }
 
-  // Shared heapRegionCache fill Fixed priority: slot0 > slot1
-  val grantHeapFill0 = heapRegionFillValid(0)
-  val grantHeapFill1 = !heapRegionFillValid(0) && heapRegionFillValid(1)
+  // Shared heapRegionCache fill：同样保留两个 slot 的同周期 fill。
+  when(heapRegionFillValid(0) && heapRegionFillValid(1)) {
+    when(heapRegionFillAddr(0) === heapRegionFillAddr(1)) {
+      heapRegionCacheValid(heapRegionCacheReplacePtr) := True
+      heapRegionCacheTag(heapRegionCacheReplacePtr)   := heapRegionFillAddr(0)
+      heapRegionCache(heapRegionCacheReplacePtr)      := heapRegionFillData(0)
+      heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + U(1)
 
-  when(grantHeapFill0 || grantHeapFill1) {
-    val fillAddr = Mux(grantHeapFill0, heapRegionFillAddr(0), heapRegionFillAddr(1))
-    val fillData = Mux(grantHeapFill0, heapRegionFillData(0), heapRegionFillData(1))
+    } otherwise {
+      val ptr0 = heapRegionCacheReplacePtr
+      val ptr1 = (heapRegionCacheReplacePtr + U(1)).resized
 
+      heapRegionCacheValid(ptr0) := True
+      heapRegionCacheTag(ptr0)   := heapRegionFillAddr(0)
+      heapRegionCache(ptr0)      := heapRegionFillData(0)
+
+      heapRegionCacheValid(ptr1) := True
+      heapRegionCacheTag(ptr1)   := heapRegionFillAddr(1)
+      heapRegionCache(ptr1)      := heapRegionFillData(1)
+
+      heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + U(2)
+    }
+
+  }.elsewhen(heapRegionFillValid(0)) {
     heapRegionCacheValid(heapRegionCacheReplacePtr) := True
-    heapRegionCacheTag(heapRegionCacheReplacePtr)   := fillAddr
-    heapRegionCache(heapRegionCacheReplacePtr)      := fillData
+    heapRegionCacheTag(heapRegionCacheReplacePtr)   := heapRegionFillAddr(0)
+    heapRegionCache(heapRegionCacheReplacePtr)      := heapRegionFillData(0)
+    heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + U(1)
 
-    heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + 1
+  }.elsewhen(heapRegionFillValid(1)) {
+    heapRegionCacheValid(heapRegionCacheReplacePtr) := True
+    heapRegionCacheTag(heapRegionCacheReplacePtr)   := heapRegionFillAddr(1)
+    heapRegionCache(heapRegionCacheReplacePtr)      := heapRegionFillData(1)
+    heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + U(1)
   }
 
-  // Centralized Copy2Survivor arbitration fixed priority: slot0 > slot1
+  // Centralized Copy2Survivor arbitration: two-slot round-robin.
   val slotWantCopySurvivor = Vec.fill(2)(Bool())
 
-  slotWantCopySurvivor(0) := slotValid(0) && slotIsCopyReq(0) &&
+  slotWantCopySurvivor(0) := slotValid(0) && slotNeedCopyReq(0) &&
       !slotCopy2SurvivorInflight(0) && !isForwardedMark(slotEffectiveMarkWord(0))
 
-  slotWantCopySurvivor(1) := slotValid(1) && slotIsCopyReq(1) &&
+  slotWantCopySurvivor(1) := slotValid(1) && slotNeedCopyReq(1) &&
       !slotCopy2SurvivorInflight(1) && !isForwardedMark(slotEffectiveMarkWord(1))
 
-  val grantCopy0 = slotWantCopySurvivor(0)
-  val grantCopy1 = !slotWantCopySurvivor(0) && slotWantCopySurvivor(1)
+  // False: conflict 时优先 slot0；True: conflict 时优先 slot1
+  val copyPrefer1 = RegInit(False)
+  val grantCopy0 = slotWantCopySurvivor(0) && (!slotWantCopySurvivor(1) || !copyPrefer1)
+  val grantCopy1 = slotWantCopySurvivor(1) && (!slotWantCopySurvivor(0) || copyPrefer1)
 
   when(grantCopy0 || grantCopy1) {
     io.Process2CopySurvivor.cmd.valid := True
@@ -540,27 +609,30 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
     when(io.Process2CopySurvivor.cmd.fire) {
       when(grantCopy0) {
+        slotNeedCopyReq(0)                := False
         slotCopy2SurvivorInflight(0)      := True
         slotCopy2SurvivorBypassGranted(0) := False
-        slotCopyReqAccepted(0) := True
+        copyPrefer1 := True
       }
 
       when(grantCopy1) {
+        slotNeedCopyReq(1)                := False
         slotCopy2SurvivorInflight(1)      := True
         slotCopy2SurvivorBypassGranted(1) := False
-        slotCopyReqAccepted(1) := True
+        copyPrefer1 := False
       }
     }
   }
 
-  // Centralized AOP arbitration fixed priority: slot0 > slot1
+  // Centralized AOP arbitration: two-slot round-robin.
   val slotWantAop = Vec.fill(2)(Bool())
 
-  slotWantAop(0) := slotValid(0) && slotIsWaitAop(0) && slotCtx(0).accessDestRegionAttr
-  slotWantAop(1) := slotValid(1) && slotIsWaitAop(1) && slotCtx(1).accessDestRegionAttr
+  slotWantAop(0) := slotValid(0) && slotIsWaitAop(0)
+  slotWantAop(1) := slotValid(1) && slotIsWaitAop(1)
 
-  val grantAop0 = slotWantAop(0)
-  val grantAop1 = !slotWantAop(0) && slotWantAop(1)
+  val aopPrefer1 = RegInit(False)
+  val grantAop0 = slotWantAop(0) && (!slotWantAop(1) || !aopPrefer1)
+  val grantAop1 = slotWantAop(1) && (!slotWantAop(0) || aopPrefer1)
 
   when(grantAop0 || grantAop1) {
     io.Process2Aop.cmd.valid := True
@@ -569,10 +641,12 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
     when(io.Process2Aop.cmd.fire) {
       when(grantAop0) {
+        aopPrefer1 := True
         finishSlot(0)
       }
 
       when(grantAop1) {
+        aopPrefer1 := False
         finishSlot(1)
       }
     }

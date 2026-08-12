@@ -9,10 +9,8 @@ import scala.language.postfixOps
 class GCAccTop extends Module with GCTopParameters {
   val io  = new GCAccTopIO
 
-  // 19 = 1(TaskStack) + 3(Fetch:PrePop,Push,Main) + 1(ArrayProcess) + 2(OopProcess) + 2(OopCopy2Survivor) + 1(Allocate) + 
-  //      3(ParAllocate) + 1(NewGCAlloc) + 1(AllocFreeRegion) + 1(Aop) + 1(Trace) +
-  //      2(Copy)
-  val LocalMMUIOsNum = 19
+  // 22 = 12 ports through Unaligned adapter + 2 direct GCCopy ports + 1 direct TaskStack port + 6 direct GCFetch ports + 1 direct GCArrayProcess port
+  val LocalMMUIOsNum = 22
 
   val gcAop = new GCAop
   val gcCopy = new GCCopy
@@ -26,11 +24,10 @@ class GCAccTop extends Module with GCTopParameters {
   val gcArrayProcess = new GCArrayProcess
   val gcAllocFreeRegion = new GCAllocFreeRegion
   val gcOopCopy2Survivor = new GCOopCopy2Survivor
-  val gcUnalignedMMUAdapter = Array.fill(LocalMMUIOsNum - 2)(new GCUnalignedMMUAdapter) // - 2(exclude Copy readMreq and writeMreq)
-
+  val gcUnalignedMMUAdapter = Array.fill(LocalMMUIOsNum - 10)(new GCUnalignedMMUAdapter) // - 7(exclude Copy read/write, TaskStack, and GCFetch)
   val gcLocalMMU = new GCLocalMMU(LocalMMUIOsNum)
   gcUnalignedMMUAdapter.zipWithIndex.foreach{ case(adapter, i) =>
-    gcLocalMMU.io.localMMUIOs(i) <> adapter.io.out
+    gcLocalMMU.io.localMMUIOs(i + 10) <> adapter.io.out
   }
 
   val task_valid = RegInit(False) // 当前有任务在进行
@@ -125,7 +122,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
 
-  gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
+  gcTaskStack.io.Mreq <> gcLocalMMU.io.localMMUIOs(0)
 
   gcTaskStack.io.ConfigIO.config.payload.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.config.payload.TaskQueue_ElemsBase := TaskQueue_ElemsBase
@@ -133,9 +130,12 @@ class GCAccTop extends Module with GCTopParameters {
   gcTaskStack.io.DebugTimeStamp := DebugTimeStamp
 
   // GCFetch
-  gcFetch.io.MainMreq <> gcUnalignedMMUAdapter(1).io.in
-  gcFetch.io.PushMreq <> gcUnalignedMMUAdapter(2).io.in
-  gcFetch.io.PreMreq <> gcUnalignedMMUAdapter(3).io.in
+  gcFetch.io.MainMreq <> gcLocalMMU.io.localMMUIOs(1)
+  gcFetch.io.PushMreq <> gcLocalMMU.io.localMMUIOs(2)
+  gcFetch.io.PreMreq0 <> gcLocalMMU.io.localMMUIOs(3)
+  gcFetch.io.PreMreq1 <> gcLocalMMU.io.localMMUIOs(4)
+  gcFetch.io.PreMreq2 <> gcLocalMMU.io.localMMUIOs(5)
+  gcFetch.io.PreMreq3 <> gcLocalMMU.io.localMMUIOs(6)
 
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
@@ -156,9 +156,26 @@ class GCAccTop extends Module with GCTopParameters {
   gcFetch.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
   gcFetch.io.DebugTimeStamp := DebugTimeStamp
 
+  // GCArrayProcess
+  gcArrayProcess.io.Mreq <> gcLocalMMU.io.localMMUIOs(7)
+
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
+  gcArrayProcess.io.ConfigIO.ChunkSize := ChunkSize
+  gcArrayProcess.io.ConfigIO.StepperOffset := StepperOffset
+  gcArrayProcess.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
+  gcArrayProcess.io.ConfigIO.HeapRegionBiasedBase := HeapRegionBiasedBase
+  gcArrayProcess.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
+  gcArrayProcess.io.DebugTimeStamp := DebugTimeStamp
+
+  // gcCopy Copy的Mreq直接连LocalMMU 不需要经过对齐(其实现在的Unaligned对于对齐的也是直连的 也可以连接Unaligned, 这里为了省部件就不连了)
+  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(8)
+  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(9)
+
   // GCOopProcess
-  gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
-  gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(5).io.in
+  gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(0).io.in
+  gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(1).io.in
 
   gcOopProcess.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
   gcOopProcess.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
@@ -175,22 +192,9 @@ class GCAccTop extends Module with GCTopParameters {
   gcOopProcess.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)
   gcOopProcess.io.DebugTimeStamp := DebugTimeStamp
 
-  // GCArrayProcess
-  gcArrayProcess.io.Mreq <> gcUnalignedMMUAdapter(6).io.in
-
-  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
-  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
-
-  gcArrayProcess.io.ConfigIO.ChunkSize := ChunkSize
-  gcArrayProcess.io.ConfigIO.StepperOffset := StepperOffset
-  gcArrayProcess.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
-  gcArrayProcess.io.ConfigIO.HeapRegionBiasedBase := HeapRegionBiasedBase
-  gcArrayProcess.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
-  gcArrayProcess.io.DebugTimeStamp := DebugTimeStamp
-
   // GCOopCopy2Survivor
-  gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(7).io.in
-  gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(8).io.in
+  gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(2).io.in
+  gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(3).io.in
 
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
 
@@ -211,7 +215,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcOopCopy2Survivor.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocate(ToParAllocate)
-  gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
+  gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(4).io.in
 
   gcAllocate.io.ToParAllocate <> gcParAllocate.io.ToParAllocate
 
@@ -225,9 +229,9 @@ class GCAccTop extends Module with GCTopParameters {
   gcAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcParAllocate
-  gcParAllocate.io.MreqPar <> gcUnalignedMMUAdapter(11).io.in
-  gcParAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(10).io.in
-  gcParAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(12).io.in
+  gcParAllocate.io.MreqPar <> gcUnalignedMMUAdapter(5).io.in
+  gcParAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(6).io.in
+  gcParAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(7).io.in
 
   gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
 
@@ -243,7 +247,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcParAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcNewAlloc
-  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
+  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(8).io.in
 
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
 
@@ -253,12 +257,12 @@ class GCAccTop extends Module with GCTopParameters {
   gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
 
   // gcAllocFreeRegion
-  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(14).io.in
+  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
 
   gcAllocFreeRegion.io.ConfigIO.G1h := G1h
 
   // gcTrace
-  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(15).io.in
+  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(10).io.in
 
   gcTrace.io.ConfigIO.ChunkSize                          := ChunkSize
   gcTrace.io.ConfigIO.RegionAttrBase                     := RegionAttrBase
@@ -275,8 +279,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcTrace.io.DebugTimeStamp                              := DebugTimeStamp
 
   // gcAop
-  gcAop.io.Mreq <> gcUnalignedMMUAdapter(16).io.in
-
+  gcAop.io.Mreq <> gcUnalignedMMUAdapter(11).io.in
   gcAop.io.Irq.clearIn()
 
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
@@ -284,11 +287,6 @@ class GCAccTop extends Module with GCTopParameters {
   gcAop.io.DebugTimeStamp := DebugTimeStamp
 
   gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty // 不会再传递新的Aop任务
-
-  // gcCopy Copy的Mreq直接连LocalMMU 不需要经过对齐(其实现在的Unaligned对于对齐的也是直连的 也可以连接Unaligned, 这里为了省部件就不连了)
-  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(17)
-  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(18)
-
 
   // gcLocalMMU
   gcLocalMMU.io.LastLevelCacheTLIO <> io.mmu2llc

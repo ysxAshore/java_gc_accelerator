@@ -126,10 +126,15 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
     }
 
     READ_DEST_LEN.whenIsActive {
-      val addr = destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
+      val addr = (destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))).resize(MMUAddrWidth)
+      val offset = addr(log2Up(LineBytesNum) - 1 downto 0)
+      val alignedAddr = addr & ~U(LineBytesNum - 1, MMUAddrWidth bits)
 
-      issueDirectRead(io.Mreq, addr.resize(MMUAddrWidth), U(4), CALC_STEP) { rd =>
-        dest_length := rd(31 downto 0)
+      // ArrayProcess only does reads here.  Do the former Unaligned-adapter
+      // line alignment locally, then extract the requested word from the line.
+      issueDirectRead(io.Mreq, alignedAddr, U(4), CALC_STEP) { rd =>
+        val shifted = rd |>> (offset << 3)
+        dest_length := shifted(31 downto 0)
       }
     }
 
@@ -149,18 +154,27 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
         goto(SEND_TRACE)
 
       } otherwise {
-        issueDirectRead(io.Mreq, heapRegionAddrLookup, U(8), READ_HUMONGOUS) { rd =>
-          heap_region := rd(GCElementWidth - 1 downto 0)
+        val addr = heapRegionAddrLookup.resize(MMUAddrWidth)
+        val offset = addr(log2Up(LineBytesNum) - 1 downto 0)
+        val alignedAddr = addr & ~U(LineBytesNum - 1, MMUAddrWidth bits)
+
+        issueDirectRead(io.Mreq, alignedAddr, U(8), READ_HUMONGOUS) { rd =>
+          val shifted = rd |>> (offset << 3)
+          heap_region := shifted(GCElementWidth - 1 downto 0)
         }
       }
     }
 
     READ_HUMONGOUS.whenIsActive {
       val addr = (heap_region.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
-      issueDirectRead(io.Mreq, addr, U(4), SEND_TRACE) { rd =>
+      val offset = addr(log2Up(LineBytesNum) - 1 downto 0)
+      val alignedAddr = addr & ~U(LineBytesNum - 1, MMUAddrWidth bits)
+
+      issueDirectRead(io.Mreq, alignedAddr, U(4), SEND_TRACE) { rd =>
+        val shifted = rd |>> (offset << 3)
         heapRegionCacheValid(heapRegionCacheReplacePtr) := True
         heapRegionCacheTag(heapRegionCacheReplacePtr)   := heapRegionAddrLookup
-        heapRegionCache(heapRegionCacheReplacePtr)      := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
+        heapRegionCache(heapRegionCacheReplacePtr)      := (shifted(31 downto 0) & U(2, 32 bits)) =/= U(0)
         heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + 1
       }
     }

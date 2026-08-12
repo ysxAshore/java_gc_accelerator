@@ -28,6 +28,10 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   }
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  // Response channel 始终保持 ready：
+  //   - ReadBack response 通过 SourceID 匹配并缓存；
+  //   - SpillOut 虽然 NeedResponse=False，但如果下游仍返回 write response，
+  //     这里直接 drain，避免 write response 堵住后续 read response。
   io.Mreq.Response.ready := True
   io.ConfigIO.Done := False
   io.ConfigIO.config.ready := False
@@ -69,6 +73,11 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val task_usage = (stack_top - stack_bottom).resize(stackPtrWidth + 1) // 硬件栈已用项数
   val task_free  = U(GCTaskStack_Entry - 1, stackPtrWidth + 1 bits) - task_usage // 牺牲一个槽判断满
 
+  // ReadBack 不再为所有 outstanding 提前占用 stack 空间。
+  // 只在存在 outstanding 时保留 1 个 cache-line 的 commit guard，
+  // 保证最老的 ReadBack response 最终一定能写回，避免 Push 把最后空间全部吃掉。
+  val readbackCommitGuard = RegInit(U(0, stackPtrWidth + 1 bits))
+
   // 使用迟滞阈值避免 SpillOut 和 ReadBack 在边界附近来回切换
   val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed + 4, task_usage.getWidth bits)
   val need_readback = (task_usage <= U(GCTaskStack_ReadNeed - 4, task_usage.getWidth bits)) && (queue_bottom =/= U(0, queuePtrWidth bits))
@@ -108,7 +117,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val inWork = Bool()
 
   // Pop / Push 接口
-  val pushCanAccept = inWork && task_free =/= U(0, task_free.getWidth bits) // 状态机在Work状态 且 stack_data 没有满
+  // 只给 ReadBack head 保留一个 line，而不是给所有 outstanding reservation。
+  val pushCanAccept = inWork && task_free > readbackCommitGuard
   io.toStack.Push.ready := pushCanAccept
 
   // push-follow PrePop 未处理完时禁止普通 Pop，避免新任务的观察次序混乱(Pop会让offset TopCache左移)
@@ -348,144 +358,804 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     }
   }
 
-  // SpillOut Area: 当片上 stack_data 太满时，从 bottom 端搬数据到 JVM queue。
-  // 这里也使用 readSync：
-  //   readReq      发起同步读
-  //   readPending  下一拍拿到数据并打包
-  //   dataValid    发 MMU write request
+  // ReadBack 独立发射游标：
+  // formal queue_bottom 只在按 request 顺序 commit 时更新；
+  // readbackQueueCursor 则随着连续 issue 向前推进。
+  val readbackQueueCursor = RegInit(U(0, queuePtrWidth bits))
+
+  val QueueElemBytes    = GCElementWidth / 8
+  val QueueElemsPerLine = LineBytesNum / QueueElemBytes
+  val QueueElemShift    = log2Up(QueueElemBytes)
+  val LineReqNumWidth   = log2Up(QueueElemsPerLine + 1)
+
+  // SpillOut Area:
+  //   1. stack_data 是同步读 RAM，因此先连续发起 RAM read；
+  //   2. RAM response 进入 2-entry skid buffer；
+  //   3. Mreq 每拍最多发送一个完整、Line 对齐的写请求；
+  //   4. NeedResponse=False，请求 fire 后立即提交 stack_bottom / queue_bottom。
+  //
+  // 所有写请求地址都按 cache line 对齐；不足一整行的部分用 RequestWStrb 屏蔽，
+  // 因而不再需要 GCUnalignedMMUAdapter。
   val spillOutArea = new Area {
-    val issued      = RegInit(False)
-    val readPending = RegInit(False)
-    val dataValid   = RegInit(False)
+    val BufferDepth   = 2
+    val BufPtrWidth   = log2Up(BufferDepth)
+    val BufCountWidth = log2Up(BufferDepth + 1)
 
-    val addrBuf        = Reg(UInt(MMUAddrWidth bits))
-    val reqNumBuf      = Reg(UInt(3 bits))
-    val stackBottomBuf = Reg(UInt(stackPtrWidth bits))
-    val queueBottomBuf = Reg(UInt(queuePtrWidth bits))
-    val packDataBuf    = Reg(UInt(MMUDataWidth bits))
+    // 从 stack_data 发出的同步读，下一拍返回。
+    val readPending       = RegInit(False)
+    val readLineAddr      = Reg(UInt(MMUAddrWidth bits))
+    val readByteOffset    = Reg(UInt(log2Up(LineBytesNum) bits))
+    val readReqNum        = Reg(UInt(LineReqNumWidth bits))
 
-    def busy: Bool = issued || readPending || dataValid
+    // 两级 skid buffer，吸收 Mreq.Request.ready 的短暂 back-pressure。
+    val bufHead  = RegInit(U(0, BufPtrWidth bits))
+    val bufTail  = RegInit(U(0, BufPtrWidth bits))
+    val bufCount = RegInit(U(0, BufCountWidth bits))
+
+    val bufAddr   = Vec.fill(BufferDepth)(Reg(UInt(MMUAddrWidth bits)))
+    val bufData   = Vec.fill(BufferDepth)(Reg(UInt(MMUDataWidth bits)))
+    val bufMask   = Vec.fill(BufferDepth)(Reg(UInt(LineBytesNum bits)))
+    val bufReqNum = Vec.fill(BufferDepth)(Reg(UInt(LineReqNumWidth bits)))
+
+    // 已经从 stack_data 预留、但尚未真正发到 Mreq 的元素数。
+    // formal stack_bottom / queue_bottom 只在 write request fire 时推进。
+    val reserved = RegInit(U(0, stackPtrWidth + 1 bits))
+
+    def busy: Bool = readPending || (bufCount =/= 0) || (reserved =/= 0)
+
+    def nextBufPtr(ptr: UInt): UInt = (ptr + U(1, BufPtrWidth bits)).resized
 
     def run(): Unit = {
-      val addr            = elemAddr(queue_bottom)
-      val emsPerLine      = MMUDataWidth / GCElementWidth
-      val offsetInLine    = addr(log2Up(LineBytesNum) - 1 downto 0) >> 3
-      val remainingInLine = emsPerLine - offsetInLine
-      val reqNum          = remainingInLine
+      // ---------------- Mreq write output ----------------
+      val outValid  = bufCount =/= 0
+      val outReqNum = bufReqNum(bufHead)
 
-      val spillPtrs = Vec((0 until 4).map(i => stkInc(stack_bottom, U(i + 1, stackPtrWidth bits))))
-      val readReq = !issued && !readPending && !dataValid
+      io.Mreq.Request.valid := outValid
+      when(outValid) {
+        io.Mreq.Request.payload.RequestVirtualAddr := bufAddr(bufHead)
+        io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
+        io.Mreq.Request.payload.RequestType_isWrite := True
+        io.Mreq.Request.payload.RequestData := bufData(bufHead)
+        io.Mreq.Request.payload.RequestWStrb := bufMask(bufHead)
+        io.Mreq.Request.payload.RequestSize := U(LineBytesNum, LineBytesNumBitSize bits)
+        io.Mreq.Request.payload.NeedResponse := False
+        io.Mreq.Request.payload.NeedDoCmpxChg := False
+      }
 
-      val spillData = Vec(
-        (0 until 4).map(i => stack_data.readSync(spillPtrs(i), readReq))
+      val sendFire = io.Mreq.Request.fire && outValid
+
+      // ---------------- stack_data read launch ----------------
+      // formal pointer + reserved = 下一批尚未预留的数据起点。
+      val reserveQueueBottom = queInc(queue_bottom, reserved.resize(queuePtrWidth))
+      val reserveStackBottom = stkInc(stack_bottom, reserved.resize(stackPtrWidth))
+
+      // Spill 触发后持续搬到 GCTaskStack_SpillNeed 附近；
+      // reserved 计入预测值，避免 pipeline 继续超发。
+      // 形成真正的 burst：
+      // need_spillOut 在 SpillNeed+4 才触发；一旦触发，不只搬回 SpillNeed，
+      // 而是继续搬到更低的 low watermark。这样至少可以连续形成多条 line write，
+      // 避免“为了支持流水加了很多状态，最后每次仍只发 1 个 request”。
+      val SpillBurstLines = 2
+      val spillLowWatermarkScala =
+        Math.min(
+          GCTaskStack_SpillNeed,
+          Math.max(
+            GCTaskStack_ReadNeed + QueueElemsPerLine,
+            GCTaskStack_SpillNeed - QueueElemsPerLine * SpillBurstLines
+          )
+        )
+
+      // 把本拍 Push / Pop 的影响也计入，避免基于旧 task_usage 多发或少发一项。
+      val usageAfterFastWide =
+        task_usage.resize(task_usage.getWidth + 1) +
+          pushFire.asUInt.resize(task_usage.getWidth + 1) -
+          popFire.asUInt.resize(task_usage.getWidth + 1)
+
+      val projectedUsageWide = Mux(
+        usageAfterFastWide >= reserved.resize(usageAfterFastWide.getWidth),
+        usageAfterFastWide - reserved.resize(usageAfterFastWide.getWidth),
+        U(0, usageAfterFastWide.getWidth bits)
       )
 
-      when(readReq) {
-        readPending    := True
-        addrBuf        := addr
-        reqNumBuf      := reqNum.resized
-        stackBottomBuf := stack_bottom
-        queueBottomBuf := queue_bottom
+      val spillTarget =
+        U(spillLowWatermarkScala, usageAfterFastWide.getWidth bits)
+
+      val spillBudgetWide = Mux(
+        projectedUsageWide > spillTarget,
+        projectedUsageWide - spillTarget,
+        U(0, usageAfterFastWide.getWidth bits)
+      )
+      val spillBudget = spillBudgetWide.resize(task_usage.getWidth)
+
+      val writeAddr = elemAddr(reserveQueueBottom)
+      val elemOffsetInLine =
+        (writeAddr(log2Up(LineBytesNum) - 1 downto 0) >> QueueElemShift)
+          .resize(task_usage.getWidth)
+      val remainingInLine =
+        U(QueueElemsPerLine, task_usage.getWidth bits) - elemOffsetInLine
+
+      val reqNumWide = Mux(spillBudget < remainingInLine, spillBudget, remainingInLine)
+      val reqNum     = reqNumWide.resize(LineReqNumWidth)
+
+      // 当前拍先考虑：
+      //   - 已有 RAM response 入 buffer；
+      //   - 当前 buffer head 被 Mreq 消费。
+      // 只有处理完这两个动作后 buffer 仍至少空一个 slot，才继续发下一次同步 RAM read。
+      val pendingArrive = readPending
+      val bufCountAfterCurrent =
+        bufCount.resize(BufCountWidth + 1) +
+          pendingArrive.asUInt.resize(BufCountWidth + 1) -
+          sendFire.asUInt.resize(BufCountWidth + 1)
+
+      val bufferHasCredit =
+        bufCountAfterCurrent < U(BufferDepth, BufCountWidth + 1 bits)
+
+      val launchRead = bufferHasCredit && reqNum =/= 0
+
+      val spillPtrs = Vec((0 until QueueElemsPerLine).map(i =>
+        stkInc(reserveStackBottom, U(i + 1, stackPtrWidth bits))))
+      val spillData = Vec((0 until QueueElemsPerLine).map(i =>
+        stack_data.readSync(spillPtrs(i), launchRead)))
+
+      // 本拍的 readPending 对应上一拍发出的 stack_data read。
+      val pendingPacked = Cat(spillData.reverse).asUInt.resize(MMUDataWidth)
+      val pendingByteCount =
+        (readReqNum.resize(LineBytesNumBitSize) << QueueElemShift).resize(LineBytesNumBitSize)
+      val pendingByteOffset = readByteOffset.resize(LineBytesNumBitSize)
+
+      val pendingWriteData =
+        (pendingPacked |<< (pendingByteOffset << 3)).resize(MMUDataWidth)
+
+      val pendingWriteMask = UInt(LineBytesNum bits)
+      pendingWriteMask := 0
+      for (b <- 0 until LineBytesNum) {
+        pendingWriteMask(b) :=
+          U(b, LineBytesNumBitSize bits) >= pendingByteOffset &&
+            U(b, LineBytesNumBitSize bits) < pendingByteOffset + pendingByteCount
       }
 
-      when(readPending) {
-        readPending := False
-        dataValid   := True
-        packDataBuf := Cat(spillData.reverse).asUInt.resize(MMUDataWidth)
+      // RAM response 入 skid buffer。
+      when(pendingArrive) {
+        bufAddr(bufTail)   := readLineAddr
+        bufData(bufTail)   := pendingWriteData
+        bufMask(bufTail)   := pendingWriteMask
+        bufReqNum(bufTail) := readReqNum
+        bufTail            := nextBufPtr(bufTail)
       }
 
-      when(dataValid) {
-        issueReq(io.Mreq, addrBuf, True, (reqNumBuf << 3).resize(LineBytesNumBitSize), packDataBuf, False, False, issued) { _ => }
+      // Mreq write request 消费 skid buffer head。
+      when(sendFire) {
+        bufHead := nextBufPtr(bufHead)
+
+        stack_bottom := stkInc(stack_bottom, outReqNum.resize(stackPtrWidth))
+        queue_bottom := queInc(queue_bottom, outReqNum.resize(queuePtrWidth))
+
+        dbg(Seq(
+          "SpillOut write fire, moveNum=", outReqNum,
+          " new queue_bottom=", queInc(queue_bottom, outReqNum.resize(queuePtrWidth))
+        ))
       }
 
-      when(issued) {
-        issued    := False
-        dataValid := False
-
-        val newQueueBottom = queInc(queueBottomBuf, reqNumBuf.resize(queuePtrWidth))
-
-        stack_bottom := stkInc(stackBottomBuf, reqNumBuf.resized)
-        queue_bottom := newQueueBottom
-
-        dbg(Seq("SpillOut, moveNum=", reqNumBuf, " old queue_bottom=", queueBottomBuf, " new queue_bottom=", newQueueBottom))
+      when(pendingArrive && !sendFire) {
+        bufCount := bufCount + U(1, BufCountWidth bits)
+      }.elsewhen(!pendingArrive && sendFire) {
+        bufCount := bufCount - U(1, BufCountWidth bits)
       }
+
+      // 发起下一拍 stack_data read，并锁存这次 read 的元数据。
+      readPending := launchRead
+      when(launchRead) {
+        readLineAddr   := writeAddr & ~U(LineBytesNum - 1, MMUAddrWidth bits)
+        readByteOffset := writeAddr(log2Up(LineBytesNum) - 1 downto 0)
+        readReqNum     := reqNum
+      }
+
+      // reservation 在 RAM read launch 时增加，在真正 write fire 时释放。
+      val launchNum = Mux(
+        launchRead,
+        reqNum.resize(reserved.getWidth),
+        U(0, reserved.getWidth bits)
+      )
+      val sentNum = Mux(
+        sendFire,
+        outReqNum.resize(reserved.getWidth),
+        U(0, reserved.getWidth bits)
+      )
+      when(launchRead || sendFire) {
+        reserved := reserved + launchNum - sentNum
+      }
+
+      // SpillOut 使用 NeedResponse=False；不等待、不匹配任何 write response。
     }
 
     def clear(): Unit = {
-      issued      := False
       readPending := False
-      dataValid   := False
+      bufHead     := 0
+      bufTail     := 0
+      bufCount    := 0
+      reserved    := 0
     }
   }
 
-  // ReadBack Area
-  // 当片上 stack_data 太空，并且 JVM queue 中还有任务时， 从 JVM queue 搬一批任务回 stack_data 的 bottom 端
+  // ReadBack Area:
+  //
+  // v5 性能结构：
+  //   1. Read request 可以连续 issue，最多 4 outstanding；
+  //   2. request 不预占 stack，只占本地 ROB slot；
+  //   3. OOO response 通过 SourceID 写入对应 slotRespData；
+  //   4. head slot 按 request 顺序 commit，commit 时才真正占 stack；
+  //   5. 只保留一个 cache-line commit guard，显著减少对 Push 的阻塞；
+  //   6. response capture / head commit / new issue 三条控制解耦；
+  //   7. 当本地 stack 和 TopCache 都空时，ReadBack commit 同拍直接 seed TopCache，
+  //      省掉“MMU -> stack RAM -> readSync -> TopCache”的额外 refill 延迟。
   val readBackArea = new Area {
-    val issued = RegInit(False)
+    val EntryNum         = Math.min(4, LLCSourceMaxNum)
+    val SlotWidth        = Math.max(1, log2Up(EntryNum))
+    val OutstandingWidth = log2Up(EntryNum + 1)
 
-    def run(): Unit = {
-      val wantNum = U(4, queue_bottom.getWidth bits)
-      val queueAvail = queue_bottom
-      val queueBottomElements = elemAddr(queue_bottom)(log2Up(LineBytesNum) - 1 downto 0) >> 3
-      val reqNumTemp = Mux(wantNum >= queueAvail, queue_bottom, wantNum)
+    val slotValid  = Vec.fill(EntryNum)(RegInit(False))
+    val slotDone   = Vec.fill(EntryNum)(RegInit(False))
+    val slotReqNum = Vec.fill(EntryNum)(RegInit(U(0, LineReqNumWidth bits)))
+    val slotLane   = Vec.fill(EntryNum)(RegInit(U(0, LineReqNumWidth bits)))
 
-      val reqNum = Mux(
-        reqNumTemp >= queueBottomElements && queueBottomElements =/= 0,
-        queueBottomElements,
-        reqNumTemp
+    // OOO response 完整缓存。response 到达时不抢 stack_data write port。
+    val slotRespData =
+      Vec.fill(EntryNum)(Reg(UInt(MMUDataWidth bits)))
+
+    // ResponseSourceID -> request slot
+    val sourceIdToSlot =
+      Reg(Vec(Seq.fill(LLCSourceMaxNum)(U(0, SlotWidth bits))))
+    val sourceIdValid =
+      Vec.fill(LLCSourceMaxNum)(RegInit(False))
+
+    val head        = RegInit(U(0, SlotWidth bits))
+    val tail        = RegInit(U(0, SlotWidth bits))
+    val outstanding = RegInit(U(0, OutstandingWidth bits))
+
+    // 只用于控制“还要不要继续预取”，不限制 Push。
+    // 它表示已经 issue、但尚未 commit 的 element 总数。
+    val inflightElems =
+      RegInit(U(0, stackPtrWidth + 2 bits))
+
+    // ReadBack burst 状态只控制“是否继续发新请求”。
+    // 即使 burstActive=False，已有 response 仍会继续 capture / commit。
+    val burstActive = RegInit(False)
+
+    // Critical-first ReadBack：
+    // 当本地 task / TopCache 已经饥饿时，burst 的第一条 ReadBack 是 demand request。
+    // 在它的 response 返回前，暂停本模块后续 prefetch read；
+    // critical response 返回当拍即可重新放行后续 request。
+    val criticalPending = RegInit(False)
+
+    // Area 外部性能计数器使用的事件信号。
+    val commitEvent        = Bool()
+    val commitBlockedEvent = Bool()
+    val topCacheSeedEvent  = Bool()
+    val criticalStartEvent = Bool()
+    val criticalRespEvent  = Bool()
+
+    commitEvent        := False
+    commitBlockedEvent := False
+    topCacheSeedEvent  := False
+    criticalStartEvent := False
+    criticalRespEvent  := False
+
+    def busy: Bool = outstanding =/= 0
+
+    def nextSlot(ptr: UInt): UInt =
+      WrapInc(ptr, EntryNum, U(1, SlotWidth bits))
+
+    def calcReqNum(cursor: UInt): UInt = {
+      val queueAddr   = elemAddr(cursor)
+      val queueOffset =
+        queueAddr(log2Up(LineBytesNum) - 1 downto 0)
+      val queueLane =
+        (queueOffset >> QueueElemShift).resize(LineReqNumWidth)
+
+      val maxInLine = Mux(
+        queueLane =/= 0,
+        queueLane,
+        U(QueueElemsPerLine, LineReqNumWidth bits)
       )
 
-      // 保留 1 个空位，避免环形栈 full / empty 无法区分。
-      val freeForReadback = Mux(
-        task_free > U(1, task_free.getWidth bits),
-        task_free - U(1, task_free.getWidth bits),
-        U(0, task_free.getWidth bits)
+      Mux(
+        cursor < maxInLine.resize(queuePtrWidth),
+        cursor.resize(LineReqNumWidth),
+        maxInLine
       )
+    }
 
-      val canReceive = Mux(
-        freeForReadback >= reqNum.resize(task_free.getWidth),
-        reqNum.resize(task_free.getWidth),
-        freeForReadback
-      )
+    // allowIssue 只控制 request channel。
+    // response / commit 每个 WORK 周期都运行。
+    def run(allowIssue: Bool): Unit = {
+      // ================================================================
+      // 1. OOO response capture
+      // ================================================================
+      val responseSource =
+        io.Mreq.Response.payload.ResponseSourceID.resized
+      val responseSlot =
+        sourceIdToSlot(responseSource)
 
-      val readIndex = queDec(queue_bottom, reqNum)
-      val readAddr  = elemAddr(readIndex)
+      // 模块顶层 Response.ready 恒为 True。
+      // 只有 sourceIdValid 命中的 response 才属于当前 ReadBack；
+      // 其它 response（例如 no-response write 仍被下游返回）直接 drain。
+      val responseReadHit =
+        io.Mreq.Response.valid &&
+          sourceIdValid(responseSource) &&
+          slotValid(responseSlot) &&
+          !slotDone(responseSlot)
 
-      issueReq(io.Mreq, readAddr, False, reqNum << 3, U(0), True, False, issued) { rd =>
-        val elems = rd.subdivideIn(GCElementWidth bits)
-        val newQueueBottom = queDec(queue_bottom, canReceive)
+      val responseFire =
+        io.Mreq.Response.fire && responseReadHit
 
-        for (i <- 0 until 4) {
-          when(i < canReceive) {
-            val writeElement = elems((reqNum - 1 - i).resized)
-            val wrPtr = stkDec(stack_bottom, U(i, stackPtrWidth bits))
+      val responseIsHead =
+        responseFire && responseSlot === head
 
-            stack_data.write(wrPtr, writeElement)
+      // critical request 是 starvation burst 的第一条 request，也就是当前 head。
+      // response 返回当拍组合地解除后续 issue 阻塞。
+      val criticalRespNow =
+        criticalPending && responseIsHead
+
+      criticalRespEvent := criticalRespNow
+
+      // ================================================================
+      // 2. Head commit
+      // ================================================================
+      val commitSlot   = head
+      val commitReqNum = slotReqNum(commitSlot)
+      val commitLane   = slotLane(commitSlot)
+
+      // Head response 当拍到达可直接 bypass，省掉一拍 slot buffer latency。
+      val headBypass =
+        responseIsHead && !slotDone(commitSlot)
+
+      val headDataReady =
+        slotValid(commitSlot) &&
+          (slotDone(commitSlot) || headBypass)
+
+      // Push 可能写 stack_data，因此 commit 与 Push 错开。
+      // Pop 不写 stack_data，可以与 ReadBack commit 同拍；
+      // Pop 还会额外释放一个 stack entry。
+      val commitFreeWide =
+        task_free.resize(task_free.getWidth + 1) +
+          popFire.asUInt.resize(task_free.getWidth + 1)
+
+      val commitHasSpace =
+        commitFreeWide >= commitReqNum.resize(commitFreeWide.getWidth)
+
+      val commitFire =
+        headDataReady &&
+          commitHasSpace &&
+          !pushFire
+
+      val commitData =
+        Mux(
+          headBypass,
+          io.Mreq.Response.payload.ResponseData,
+          slotRespData(commitSlot)
+        )
+
+      val canSeedTopCache =
+        task_empty &&
+          topCacheEmpty &&
+          !refillRespValid &&
+          !pushFire
+
+      commitEvent        := commitFire
+      commitBlockedEvent := headDataReady && !commitFire
+      topCacheSeedEvent  := commitFire && canSeedTopCache
+
+      // 非 head response 一律先缓存。
+      // head response 如果本拍不能 commit（例如刚好 Push），也必须缓存，不能丢。
+      when(responseFire) {
+        sourceIdValid(responseSource) := False
+
+        when(!headBypass || !commitFire) {
+          slotRespData(responseSlot) := io.Mreq.Response.payload.ResponseData
+          slotDone(responseSlot)     := True
+        }
+
+        dbg(Seq(
+          "ReadBack response, slot=", responseSlot,
+          " isHead=", responseIsHead,
+          " commitNow=", commitFire
+        ))
+      }
+
+      when(commitFire) {
+        val elems =
+          commitData.subdivideIn(GCElementWidth bits)
+
+        // commit 时才决定物理 stack 位置。
+        // 因为 request/response 顺序由 head 保证，所以完全不需要 issue 时预留 stackBase。
+        for (i <- 0 until QueueElemsPerLine) {
+          when(U(i, LineReqNumWidth bits) < commitReqNum) {
+            val lane =
+              commitLane + commitReqNum -
+                U(i + 1, LineReqNumWidth bits)
+
+            val wrPtr =
+              stkDec(stack_bottom, U(i, stackPtrWidth bits))
+
+            stack_data.write(wrPtr, elems(lane.resized))
             prefetched(wrPtr) := False
           }
         }
 
-        stack_bottom := stkDec(stack_bottom, canReceive)
-        queue_bottom := newQueueBottom
+        // ----------------------------------------------------------------
+        // Fast empty-stack bypass:
+        // 当 ReadBack 前本地完全空时，这批数据就是新的栈顶数据。
+        // 同拍直接灌入 TopCache，下一拍 Fetch 就能看到，不必再走 stack_data.readSync refill。
+        // ----------------------------------------------------------------
+        when(canSeedTopCache) {
+          val seedCountWide =
+            Mux(
+              commitReqNum.resize(topCacheCountWidth) >
+                U(TopCacheDepth, topCacheCountWidth bits),
+              U(TopCacheDepth, topCacheCountWidth bits),
+              commitReqNum.resize(topCacheCountWidth)
+            )
+
+          topCacheCount := seedCountWide
+
+          val SeedMax = Math.min(TopCacheDepth, QueueElemsPerLine)
+          for (i <- 0 until SeedMax) {
+            when(U(i, LineReqNumWidth bits) < commitReqNum) {
+              val lane =
+                commitLane + commitReqNum -
+                  U(i + 1, LineReqNumWidth bits)
+              val cacheIdx =
+                stkDec(stack_top, U(i, stackPtrWidth bits))
+
+              topCacheData(i)       := elems(lane.resized)
+              topCacheIdx(i)        := cacheIdx
+              topCachePrefetched(i) := False
+            }
+          }
+
+          dbg(Seq(
+            "ReadBack seed TopCache, count=", seedCountWide
+          ))
+        }
+
+        stack_bottom :=
+          stkDec(stack_bottom, commitReqNum.resize(stackPtrWidth))
+        queue_bottom :=
+          queDec(queue_bottom, commitReqNum.resize(queuePtrWidth))
+
+        slotValid(commitSlot) := False
+        slotDone(commitSlot)  := False
+        head := nextSlot(head)
 
         dbg(Seq(
-          "ReadBack, reqNum=", reqNum,
-          " receive=", canReceive,
-          " old queue_bottom=", queue_bottom,
-          " new queue_bottom=", newQueueBottom
+          "ReadBack commit, slot=", commitSlot,
+          " lane=", commitLane,
+          " moveNum=", commitReqNum,
+          " new queue_bottom=",
+          queDec(queue_bottom, commitReqNum.resize(queuePtrWidth))
         ))
+      }
+
+      // ================================================================
+      // 3. Adaptive burst issue
+      // ================================================================
+      val issueCursor =
+        Mux(outstanding === 0, queue_bottom, readbackQueueCursor)
+
+      val naturalReqNum =
+        calcReqNum(issueCursor)
+
+      // 一次触发后允许预取到 high watermark。
+      // inflightElems 只参与“是否继续 issue”，不再从 task_free 中扣掉。
+      val ReadBackBurstLines = 3
+      val readHighWatermarkScala =
+        Math.max(
+          GCTaskStack_ReadNeed,
+          Math.min(
+            GCTaskStack_SpillNeed - QueueElemsPerLine,
+            GCTaskStack_ReadNeed + QueueElemsPerLine * ReadBackBurstLines
+          )
+        )
+
+      val usageAfterFastWide =
+        task_usage.resize(task_usage.getWidth + 2) +
+          pushFire.asUInt.resize(task_usage.getWidth + 2) -
+          popFire.asUInt.resize(task_usage.getWidth + 2)
+
+      val projectedUsageWide =
+        usageAfterFastWide +
+          inflightElems.resize(usageAfterFastWide.getWidth)
+
+      val readTarget =
+        U(readHighWatermarkScala, projectedUsageWide.getWidth bits)
+
+      val roomToTargetWide = Mux(
+        projectedUsageWide < readTarget,
+        readTarget - projectedUsageWide,
+        U(0, projectedUsageWide.getWidth bits)
+      )
+
+      // need_readback 触发本轮 burst；之后即使 formal usage 越过 low watermark，
+      // 仍可继续 issue 到 high watermark。
+      val issueMode =
+        burstActive || need_readback
+
+      when(need_readback) {
+        burstActive := True
+      }
+
+      // 如果 workload 反向增长到 Spill 区，立即停止发新的 ReadBack；
+      // 但已有 outstanding 仍继续 response/commit。
+      when(
+        projectedUsageWide >= readTarget ||
+          issueCursor === 0 ||
+          need_spillOut
+      ) {
+        burstActive := False
+      }
+
+      val issueReqNum =
+        Mux(
+          naturalReqNum.resize(roomToTargetWide.getWidth) >
+            roomToTargetWide,
+          roomToTargetWide.resize(LineReqNumWidth),
+          naturalReqNum
+        )
+
+      val issueReadIdx =
+        queDec(issueCursor, issueReqNum.resize(queuePtrWidth))
+
+      val issueReadAddr =
+        elemAddr(issueReadIdx)
+
+      val issueLineAddr =
+        issueReadAddr & ~U(LineBytesNum - 1, MMUAddrWidth bits)
+
+      val issueReadLane =
+        (issueReadAddr(log2Up(LineBytesNum) - 1 downto 0) >>
+          QueueElemShift).resize(LineReqNumWidth)
+
+      val slotHasSpace =
+        outstanding < U(EntryNum, OutstandingWidth bits) ||
+          commitFire
+
+      // burst 的第一条 request 建立时，必须确保本拍 Push/Pop 之后仍能留下
+      // 一个完整 cache-line 的 commit guard。后续 outstanding request 只占 ROB，
+      // 不再额外扣 task_free。
+      val freeAfterFastWide =
+        task_free.resize(task_free.getWidth + 1) +
+          popFire.asUInt.resize(task_free.getWidth + 1) -
+          pushFire.asUInt.resize(task_free.getWidth + 1)
+
+      val firstIssueHasGuard =
+        outstanding =/= 0 ||
+          freeAfterFastWide >=
+            U(QueueElemsPerLine, freeAfterFastWide.getWidth bits)
+
+      // starvation 时第一条 demand read 尚未返回，则暂停本模块后续 prefetch。
+      // criticalRespNow 当拍即可恢复 issue：
+      // 可以做到 Resp(critical) 与下一条 Req 同拍 fire。
+      val criticalBlocksIssue =
+        criticalPending && !criticalRespNow
+
+      val canIssue =
+        allowIssue &&
+          issueMode &&
+          issueCursor =/= 0 &&
+          issueReqNum =/= 0 &&
+          slotHasSpace &&
+          firstIssueHasGuard &&
+          !criticalBlocksIssue
+
+      io.Mreq.Request.valid := canIssue
+
+      when(canIssue) {
+        io.Mreq.Request.payload.RequestVirtualAddr := issueLineAddr
+        io.Mreq.Request.payload.RequestSourceID :=
+          io.Mreq.ConherentRequsetSourceID.payload
+        io.Mreq.Request.payload.RequestType_isWrite := False
+        io.Mreq.Request.payload.RequestData := 0
+        io.Mreq.Request.payload.RequestWStrb := 0
+        io.Mreq.Request.payload.RequestSize :=
+          U(LineBytesNum, LineBytesNumBitSize bits)
+        io.Mreq.Request.payload.NeedResponse := True
+        io.Mreq.Request.payload.NeedDoCmpxChg := False
+      }
+
+      val requestFire =
+        io.Mreq.Request.fire && canIssue
+
+      when(requestFire) {
+        val issueSlot =
+          tail
+        val sourceId =
+          io.Mreq.ConherentRequsetSourceID.payload.resized
+
+        slotValid(issueSlot)  := True
+        slotDone(issueSlot)   := False
+        slotReqNum(issueSlot) := issueReqNum
+        slotLane(issueSlot)   := issueReadLane
+
+        sourceIdToSlot(sourceId) := issueSlot
+        sourceIdValid(sourceId)  := True
+
+        tail := nextSlot(tail)
+
+        readbackQueueCursor :=
+          issueReadIdx
+
+        // 只有从 0 outstanding 启动，且本地供给已经饥饿时，
+        // 才把第一条 request 标成 critical。
+        // 正常后台 ReadBack 仍保持最多 4 outstanding。
+        when(
+          outstanding === 0 &&
+            (task_empty || topCacheEmpty)
+        ) {
+          criticalPending  := True
+          criticalStartEvent := True
+        }
+
+        dbg(Seq(
+          "ReadBack request, slot=", issueSlot,
+          " alignedAddr=", issueLineAddr,
+          " actualAddr=", issueReadAddr,
+          " lane=", issueReadLane,
+          " moveNum=", issueReqNum,
+          " outstanding=", outstanding,
+          " critical=", outstanding === 0 && (task_empty || topCacheEmpty)
+        ))
+      }
+
+      when(criticalRespNow) {
+        criticalPending := False
+      }
+
+      // ================================================================
+      // 4. Outstanding / inflight / one-line guard bookkeeping
+      // ================================================================
+      when(requestFire && !commitFire) {
+        outstanding :=
+          outstanding + U(1, OutstandingWidth bits)
+      }.elsewhen(!requestFire && commitFire) {
+        outstanding :=
+          outstanding - U(1, OutstandingWidth bits)
+      }
+
+      val issueNum =
+        Mux(
+          requestFire,
+          issueReqNum.resize(inflightElems.getWidth),
+          U(0, inflightElems.getWidth bits)
+        )
+
+      val commitNum =
+        Mux(
+          commitFire,
+          commitReqNum.resize(inflightElems.getWidth),
+          U(0, inflightElems.getWidth bits)
+        )
+
+      when(requestFire || commitFire) {
+        inflightElems :=
+          inflightElems + issueNum - commitNum
+      }
+
+      // 只要还有至少一个 ReadBack request 未 commit，就保留一个完整 line 的空间。
+      // ring 从 0->1 时建立 guard；最后一个 commit 后释放。
+      when(requestFire && outstanding === 0 && !commitFire) {
+        readbackCommitGuard :=
+          U(QueueElemsPerLine, readbackCommitGuard.getWidth bits)
+      }
+
+      when(commitFire && !requestFire && outstanding === 1) {
+        readbackCommitGuard := 0
+      }
+
+      // outstanding=1 且 commit/request 同拍：旧 head 退出，新 request 进入，
+      // guard 保持一个 line，不需要修改。
+      when(requestFire && commitFire && outstanding === 0) {
+        readbackCommitGuard :=
+          U(QueueElemsPerLine, readbackCommitGuard.getWidth bits)
       }
     }
 
     def clear(): Unit = {
-      issued := False
+      head                := 0
+      tail                := 0
+      outstanding         := 0
+      inflightElems       := 0
+      burstActive         := False
+      criticalPending     := False
+      readbackCommitGuard := 0
+
+      for (i <- 0 until EntryNum) {
+        slotValid(i)    := False
+        slotDone(i)     := False
+        slotReqNum(i)   := 0
+        slotLane(i)     := 0
+        slotRespData(i) := 0
+      }
+
+      for (i <- 0 until LLCSourceMaxNum) {
+        sourceIdValid(i)  := False
+        sourceIdToSlot(i) := 0
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Performance observability
+  // ------------------------------------------------------------------
+  // 可直接从波形/Verilog 观察：
+  //   reqUtil = perfMemReqFireCycles / perfWorkCycles
+  //   perfMaxOutstanding：ReadBack MLP
+  //   perfCriticalReadStarts / perfCriticalReadResps：
+  //     critical-first ReadBack 的触发 / 完成次数
+  val perfWorkCycles       = RegInit(U(0, 64 bits))
+  val perfMemReqFireCycles = RegInit(U(0, 64 bits))
+  val perfReadReqs         = RegInit(U(0, 64 bits))
+  val perfWriteReqs        = RegInit(U(0, 64 bits))
+  val perfResponses        = RegInit(U(0, 64 bits))
+  val perfPushGuardStall   = RegInit(U(0, 64 bits))
+  val perfReadCommitBlocked = RegInit(U(0, 64 bits))
+  val perfTopCacheSeed       = RegInit(U(0, 64 bits))
+  val perfCriticalReadStarts = RegInit(U(0, 64 bits))
+  val perfCriticalReadResps  = RegInit(U(0, 64 bits))
+  val perfMaxOutstanding =
+    RegInit(U(0, readBackArea.OutstandingWidth bits))
+
+  when(inWork) {
+    perfWorkCycles := perfWorkCycles + 1
+
+    when(io.Mreq.Request.fire) {
+      perfMemReqFireCycles := perfMemReqFireCycles + 1
+
+      when(io.Mreq.Request.payload.RequestType_isWrite) {
+        perfWriteReqs := perfWriteReqs + 1
+      }.otherwise {
+        perfReadReqs := perfReadReqs + 1
+      }
+    }
+
+    when(io.Mreq.Response.fire) {
+      perfResponses := perfResponses + 1
+    }
+
+    when(
+      io.toStack.Push.valid &&
+        !io.toStack.Push.ready &&
+        task_free =/= 0 &&
+        task_free <= readbackCommitGuard
+    ) {
+      perfPushGuardStall := perfPushGuardStall + 1
+    }
+
+    when(readBackArea.commitBlockedEvent) {
+      perfReadCommitBlocked := perfReadCommitBlocked + 1
+    }
+
+    when(readBackArea.topCacheSeedEvent) {
+      perfTopCacheSeed := perfTopCacheSeed + 1
+    }
+
+    when(readBackArea.criticalStartEvent) {
+      perfCriticalReadStarts := perfCriticalReadStarts + 1
+    }
+
+    when(readBackArea.criticalRespEvent) {
+      perfCriticalReadResps := perfCriticalReadResps + 1
+    }
+
+    when(readBackArea.outstanding > perfMaxOutstanding) {
+      perfMaxOutstanding := readBackArea.outstanding
     }
   }
 
   // Task exhausted
   // 注意 TopCache / refill response 也要算进去。 否则可能 stack_top == stack_bottom 时提前结束。
   val task_exhausted = task_empty && queue_bottom === U(0) && topCacheCount === U(0) &&
-    !refillRespValid && push_count === U(0) && pushPrePopRem === U(0)
+    !refillRespValid && push_count === U(0) && pushPrePopRem === U(0) &&
+    !spillOutArea.busy && !readBackArea.busy
 
   // FSM
   val fsm = new StateMachine {
@@ -524,6 +1194,19 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       stack_top    := U(0, stackPtrWidth bits)
       stack_bottom := U(0, stackPtrWidth bits)
       queue_bottom := U(0, queuePtrWidth bits)
+      readbackQueueCursor := U(0, queuePtrWidth bits)
+
+      perfWorkCycles       := 0
+      perfMemReqFireCycles := 0
+      perfReadReqs         := 0
+      perfWriteReqs        := 0
+      perfResponses        := 0
+      perfPushGuardStall   := 0
+      perfReadCommitBlocked := 0
+      perfTopCacheSeed       := 0
+      perfCriticalReadStarts := 0
+      perfCriticalReadResps  := 0
+      perfMaxOutstanding     := 0
 
       topCacheCount := U(0, topCacheCountWidth bits)
 
@@ -546,10 +1229,24 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       when(!task_exhausted || !io.toFetch.Pop.ready) {
         handleFastPath()
 
-        when(need_spillOut || spillOutArea.busy) {
+        // ReadBack 的 response capture / head commit 每拍都运行。
+        // 是否继续发新的 Read request 单独由 allowReadIssue 控制。
+        //
+        // queue_bottom 同时被 SpillOut(+方向)和 ReadBack commit(-方向)维护，
+        // 因此 ReadBack 仍有 outstanding 时不能启动 SpillOut；
+        // 但可以立即停止继续 issue ReadBack，让旧请求尽快 drain。
+        val spillCanRun =
+          !readBackArea.busy &&
+            (spillOutArea.busy || need_spillOut)
+
+        val allowReadIssue =
+          !spillOutArea.busy &&
+            !need_spillOut
+
+        readBackArea.run(allowReadIssue)
+
+        when(spillCanRun) {
           spillOutArea.run()
-        }.elsewhen(need_readback) {
-          readBackArea.run()
         }
       }
 

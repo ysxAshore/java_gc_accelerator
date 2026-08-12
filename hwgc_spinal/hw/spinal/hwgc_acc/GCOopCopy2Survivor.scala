@@ -33,6 +33,11 @@ case class CopySurvivorSlotRuntime() extends Bundle with GCTopParameters {
   val plabForceOld   = Bool()
 
   val monitor_mw         = UInt(GCElementWidth bits)
+  val monitorReadDone    = Bool()
+  val monitorUpdateDone  = Bool()
+
+  // PLAB refill 只保留一个 FSM state，用 phase 表示 ptr/buffer/top-end 三段依赖访存。
+  val plabRefillPhase    = UInt(2 bits)
   val plabBufferPtr      = UInt(GCElementWidth bits)
   val plabBuffer         = UInt(GCElementWidth bits)
   val plabCacheBottom    = UInt(GCElementWidth bits)
@@ -166,6 +171,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
   val plabCacheBuffer = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheBufferPtr = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val plabCacheBufferPtrValid = Vec.fill(2)(RegInit(False))
   val plabCacheBufferValid = Vec.fill(2)(RegInit(False))
   val plabCacheTop = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheEnd = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
@@ -233,9 +239,11 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val destAttrFillValid = Vec.fill(2)(Bool())
   val destAttrFillData = Vec.fill(2)(UInt(32 bits))
 
-  val plabPtrFillValid = Vec.fill(2)(Bool())
-  val plabPtrFillIdx = Vec.fill(2)(UInt(1 bits))
-  val plabPtrFillData = Vec.fill(2)(UInt(GCElementWidth bits))
+  // PlabAllocatorPtr + 0x10/0x18 是两个连续的 buffer-pointer 槽。
+  // 第一次 miss 直接 16B 读取两个 pointer，顺手预取另一个 idx。
+  val plabPtrPairFillValid = Vec.fill(2)(Bool())
+  val plabPtrPairFillData0 = Vec.fill(2)(UInt(GCElementWidth bits))
+  val plabPtrPairFillData1 = Vec.fill(2)(UInt(GCElementWidth bits))
 
   val plabBufFillValid = Vec.fill(2)(Bool())
   val plabBufFillIdx = Vec.fill(2)(UInt(1 bits))
@@ -254,9 +262,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     destAttrFillValid(i) := False
     destAttrFillData(i) := U(0, 32 bits)
 
-    plabPtrFillValid(i) := False
-    plabPtrFillIdx(i) := U(0, 1 bits)
-    plabPtrFillData(i) := U(0, GCElementWidth bits)
+    plabPtrPairFillValid(i) := False
+    plabPtrPairFillData0(i) := U(0, GCElementWidth bits)
+    plabPtrPairFillData1(i) := U(0, GCElementWidth bits)
 
     plabBufFillValid(i) := False
     plabBufFillIdx(i) := U(0, 1 bits)
@@ -370,8 +378,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   // Slot Fsms
   val slotIsPlabSelect = Vec.fill(2)(Bool()) // 状态泄漏
   val slotIsAllocCache = Vec.fill(2)(Bool())
-  val slotIsSendCopyWork = Vec.fill(2)(Bool())
-  val slotIsSendTraceWork = Vec.fill(2)(Bool())
+  val slotIsRunCopyTrace = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
     val m = slotMreq(i)
@@ -384,22 +391,16 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       val AGE_DECIDE = new State
 
       val PLAB_SELECT = new State
-      val READ_PLAB_PTR = new State
-      val READ_PLAB_BUF = new State
-      val READ_PLAB_TOPEND = new State
+      val REFILL_PLAB = new State
 
       val ALLOC_CACHE = new State
-      val WAIT_ALLOC = new State
       val WRITE_FORCE_OLD = new State
 
       val DECIDE_FORWARD_PTR = new State
 
-      val SEND_COPY_WORK = new State
-      val SEND_TRACE_WORK = new State
-
-      val GET_MONITOR_MW = new State
-      val WRITE_MONITOR_MW = new State
-      val WAIT_COPY_TRACE = new State
+      // Copy 发出后，在一个状态里并行推进 header write / Trace / completion wait。
+      // Trace 的仲裁仍然由 copyIssued 硬门控，因此不会早于 Copy.cmd.fire。
+      val RUN_COPY_TRACE = new State
 
       val READ_BOTTOM_HARD_END = new State
       val WRITE_FORWARDPTR_NOT_ZERO = new State
@@ -589,7 +590,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
             }
 
           } otherwise {
-            // cache 无效，需要 refill top/end
+            // cache 无效，需要 refill top/end。
+            // 进入一个 phase-based state，避免 ptr -> buffer -> top/end 三个 FSM state。
             when(slotPlabRefillGrant(i)) {
               when(!ownsPlab(i, idx)) {
                 lockPlab(i, idx)
@@ -597,47 +599,64 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
               when(plabCacheBufferValid(idx)) {
                 slotCtx(i).runtime.plabBuffer := plabCacheBuffer(idx)
-                goto(READ_PLAB_TOPEND)
-              } otherwise {
-                goto(READ_PLAB_PTR)
+                slotCtx(i).runtime.plabRefillPhase := U(2)
+              }.elsewhen(plabCacheBufferPtrValid(idx)) {
+                slotCtx(i).runtime.plabBufferPtr := plabCacheBufferPtr(idx)
+                slotCtx(i).runtime.plabRefillPhase := U(1)
+              }.otherwise {
+                slotCtx(i).runtime.plabRefillPhase := U(0)
               }
+
+              goto(REFILL_PLAB)
             }
           }
         }
       }
 
-      READ_PLAB_PTR.whenIsActive {
-        val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + sizeBytesOf(slotCtx(i).runtime.plabTargetIdx.resized)).resize(MMUAddrWidth)
-        issueDirectRead(m, addr, U(8), READ_PLAB_BUF) { rd =>
-          plabPtrFillValid(i) := True
-          plabPtrFillIdx(i) := slotCtx(i).runtime.plabTargetIdx
-          plabPtrFillData(i) := rd(GCElementWidth - 1 downto 0)
-          slotCtx(i).runtime.plabBufferPtr := rd(GCElementWidth - 1 downto 0)
-        }
-      }
-
-      READ_PLAB_BUF.whenIsActive {
+      REFILL_PLAB.whenIsActive {
         val idx = slotCtx(i).runtime.plabTargetIdx
 
-        issueDirectRead(m, slotCtx(i).runtime.plabBufferPtr, U(8), READ_PLAB_TOPEND) { rd =>
-          plabBufFillValid(i) := True
-          plabBufFillIdx(i) := idx
-          plabBufFillData(i) := rd(GCElementWidth - 1 downto 0)
-          slotCtx(i).runtime.plabBuffer := rd(GCElementWidth - 1 downto 0)
-        }
-      }
+        switch(slotCtx(i).runtime.plabRefillPhase) {
+          is(U(0)) {
+            // 两个 pointer 位于 +0x10/+0x18，一次 16B 读同时预取 idx0/idx1。
+            val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10").resize(MMUAddrWidth)
 
-      READ_PLAB_TOPEND.whenIsActive {
-        val idx = slotCtx(i).runtime.plabTargetIdx
-        val addr = (slotCtx(i).runtime.plabBuffer + U"x30").resize(MMUAddrWidth)
+            issueDirectRead(m, addr, U(16), REFILL_PLAB) { rd =>
+              val ptr0 = rd(GCElementWidth - 1 downto 0)
+              val ptr1 = rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
-        issueDirectRead(m, addr, U(16),  PLAB_SELECT) { rd =>
-          plabTopEndFillValid(i) := True
-          plabTopEndFillIdx(i) := idx
-          plabTopFillData(i) := rd(GCElementWidth - 1 downto 0)
-          plabEndFillData(i) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+              plabPtrPairFillValid(i) := True
+              plabPtrPairFillData0(i) := ptr0
+              plabPtrPairFillData1(i) := ptr1
 
-          unlockPlab(i, idx)
+              slotCtx(i).runtime.plabBufferPtr := Mux(idx === U(0), ptr0, ptr1)
+              slotCtx(i).runtime.plabRefillPhase := U(1)
+            }
+          }
+
+          is(U(1)) {
+            issueDirectRead(m, slotCtx(i).runtime.plabBufferPtr, U(8), REFILL_PLAB) { rd =>
+              plabBufFillValid(i) := True
+              plabBufFillIdx(i) := idx
+              plabBufFillData(i) := rd(GCElementWidth - 1 downto 0)
+
+              slotCtx(i).runtime.plabBuffer := rd(GCElementWidth - 1 downto 0)
+              slotCtx(i).runtime.plabRefillPhase := U(2)
+            }
+          }
+
+          default {
+            val addr = (slotCtx(i).runtime.plabBuffer + U"x30").resize(MMUAddrWidth)
+
+            issueDirectRead(m, addr, U(16), PLAB_SELECT) { rd =>
+              plabTopEndFillValid(i) := True
+              plabTopEndFillIdx(i) := idx
+              plabTopFillData(i) := rd(GCElementWidth - 1 downto 0)
+              plabEndFillData(i) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+              unlockPlab(i, idx)
+            }
+          }
         }
       }
 
@@ -645,66 +664,54 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         val idx = slotCtx(i).runtime.plabTargetIdx
         val otherIdx = U(1) - idx
 
-        // ALLOC_CACHE 必须持有当前 idx 的 lock 如果没有 lock，说明状态被异常打进来，回 PLAB_SELECT 重新申请。
+        // ALLOC_CACHE 同时承担 request + wait-done，allocIssued 本身就是 phase bit。
+        // 这样等待 ToAllocate 时不会再占一个独立 FSM state。
         when(!ownsPlab(i, idx)) {
           goto(PLAB_SELECT)
         } otherwise {
-          slotCtx(i).runtime.destOopPtr := U(0)
+          when(!slotCtx(i).runtime.allocIssued) {
+            slotCtx(i).runtime.destOopPtr := U(0)
 
-          when(plabCacheValid(otherIdx) && plabCacheBuffer(0) === plabCacheBuffer(1)) {
-            plabCacheValid(otherIdx) := False
-          }
+            when(plabCacheValid(otherIdx) && plabCacheBuffer(0) === plabCacheBuffer(1)) {
+              plabCacheValid(otherIdx) := False
+            }
+            plabCacheValid(idx) := False
 
-          plabCacheValid(idx) := False
-
-          when(slotCtx(i).runtime.allocIssued) {
-            slotCtx(i).runtime.allocIssued := False
-            slotCtx(i).runtime.afterAllocCache := True
-            slotCtx(i).runtime.usingPlabCacheBuffer := False
-            slotCtx(i).runtime.plabBuffer := plabCacheBuffer(idx)
-
-            goto(WAIT_ALLOC)
-          }
-        }
-      }
-
-      WAIT_ALLOC.whenIsActive {
-        val idx = slotCtx(i).runtime.plabTargetIdx
-
-        when(slotCtx(i).runtime.allocDone) {
-          when(slotCtx(i).runtime.destOopPtr === U(0, GCElementWidth bits)) {
-            // 当前 idx 分配失败，切到 old idx 前先释放当前 idx lock。
-            unlockPlab(i, idx)
-
-            slotCtx(i).runtime.allocDone := False
-            slotCtx(i).runtime.plabTargetIdx := U(1, 1 bits)
-            slotCtx(i).runtime.plabForceOld := True
-
-            goto(PLAB_SELECT)
           } otherwise {
-            // ToAllocate 已经完成，当前 idx 的本地 cache 已失效。
-            unlockPlab(i, idx)
-
             slotCtx(i).runtime.afterAllocCache := True
             slotCtx(i).runtime.usingPlabCacheBuffer := False
             slotCtx(i).runtime.plabBuffer := plabCacheBuffer(idx)
+          }
 
-            when(slotCtx(i).runtime.plabForceOld) {
-              when(slotCtx(i).runtime.plab_refill_failed) {
-                slotCtx(i).configs.ageThreshold := U(0)
-                io.UpdateAgeThreshold.valid := True
-                io.UpdateAgeThreshold.payload := U(0)
+          when(slotCtx(i).runtime.allocDone) {
+            slotCtx(i).runtime.allocIssued := False
+            slotCtx(i).runtime.allocDone := False
 
-                issueDirectWriteWithoutResp(m, io.ConfigIO.ParScanThreadStatePtr + U"x17c", U(4), U(0), WRITE_FORCE_OLD) {
-                  slotCtx(i).runtime.allocDone := False
-                }
-              }.otherwise{
-                slotCtx(i).runtime.allocDone := False
-                goto(WRITE_FORCE_OLD)
-              }
+            when(slotCtx(i).runtime.destOopPtr === U(0, GCElementWidth bits)) {
+              // 当前 idx 分配失败，切到 old idx 前先释放当前 idx lock。
+              unlockPlab(i, idx)
+              slotCtx(i).runtime.plabTargetIdx := U(1, 1 bits)
+              slotCtx(i).runtime.plabForceOld := True
+
+              goto(PLAB_SELECT)
+
             } otherwise {
-              slotCtx(i).runtime.allocDone := False
-              goto(DECIDE_FORWARD_PTR)
+              // ToAllocate 已经完成，当前 idx 的本地 cache 已失效。
+              unlockPlab(i, idx)
+
+              when(slotCtx(i).runtime.plabForceOld) {
+                when(slotCtx(i).runtime.plab_refill_failed) {
+                  slotCtx(i).configs.ageThreshold := U(0)
+                  io.UpdateAgeThreshold.valid := True
+                  io.UpdateAgeThreshold.payload := U(0)
+
+                  issueDirectWriteWithoutResp(m, io.ConfigIO.ParScanThreadStatePtr + U"x17c", U(4), U(0), WRITE_FORCE_OLD) ()
+                }.otherwise{
+                  goto(WRITE_FORCE_OLD)
+                }
+              } otherwise {
+                goto(DECIDE_FORWARD_PTR)
+              }
             }
           }
         }
@@ -729,67 +736,59 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       DECIDE_FORWARD_PTR.whenIsActive {
         // @notice: atomic-cas
         val newMw = forwardingMarkOf(slotCtx(i).runtime.destOopPtr)
-        casForwardPtr(slotCtx(i).configs.srcOopPtr, slotCtx(i).configs.markWord, newMw, SEND_COPY_WORK, READ_BOTTOM_HARD_END)
+        casForwardPtr(slotCtx(i).configs.srcOopPtr, slotCtx(i).configs.markWord, newMw, RUN_COPY_TRACE, READ_BOTTOM_HARD_END)
       }
 
-      SEND_COPY_WORK.whenIsActive {
+      RUN_COPY_TRACE.whenIsActive {
         val copyIssuedDone = slotCtx(i).runtime.copyIssued
-
-        when(copyIssuedDone){
-          goto(SEND_TRACE_WORK)
-        }
-      }
-
-      SEND_TRACE_WORK.whenIsActive {
-        when(!slotCtx(i).runtime.writeDestOopPtrDone) {
-          val addr = slotCtx(i).runtime.destOopPtr.resize(MMUAddrWidth)
-          val newAge = nextAge(slotCtx(i).runtime.age)
-          val writeValue = Mux(
-            slotCtx(i).runtime.destRegionAttr(15 downto 8) === 0 && slotCtx(i).configs.markWord(0),
-            replaceAge(slotCtx(i).configs.markWord, newAge),
-            slotCtx(i).configs.markWord
-          )
-
-          issueReq(m, addr, True, U(8), writeValue, False, False, issued) { _ => }
-
-          when(issued) {
-            issued := False
-            slotCtx(i).runtime.writeDestOopPtrDone := True
-          }
-        }
-
-        val needTrace = slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
-        val traceIssuedDone = slotCtx(i).runtime.traceIssued || !needTrace
-
-        when(traceIssuedDone && slotCtx(i).runtime.writeDestOopPtrDone) {
-          when(slotCtx(i).runtime.destOopPtr(15 downto 0) === 0 && !slotCtx(i).configs.markWord(0)) {
-            goto(GET_MONITOR_MW)
-          }.otherwise {
-            goto(WAIT_COPY_TRACE)
-          }
-        }
-      }
-
-      GET_MONITOR_MW.whenIsActive {
-        issueDirectRead(m, monitorMarkAddr(slotCtx(i).configs.markWord), U(8), WRITE_MONITOR_MW) { rd =>
-          slotCtx(i).runtime.monitor_mw := rd(GCElementWidth - 1 downto 0)
-        }
-      }
-
-      WRITE_MONITOR_MW.whenIsActive {
-        val addr = monitorMarkAddr(slotCtx(i).configs.markWord)
-        val newAge = nextAge(slotCtx(i).runtime.age)
-        val writeValue = replaceAge(slotCtx(i).runtime.monitor_mw, newAge)
-
-        issueDirectWriteWithoutResp(m, addr, U(8), writeValue, WAIT_COPY_TRACE) ()
-      }
-
-      WAIT_COPY_TRACE.whenIsActive {
         val needTrace = slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
         val copyFinished = slotCtx(i).runtime.copyDone
         val traceFinished = slotCtx(i).runtime.traceDone || !needTrace
+        val needMonitorUpdate = slotCtx(i).runtime.destOopPtr(15 downto 0) === 0 && !slotCtx(i).configs.markWord(0)
+        val memoryPostDone = slotCtx(i).runtime.writeDestOopPtrDone &&
+          (!needMonitorUpdate || slotCtx(i).runtime.monitorUpdateDone)
 
-        when(copyFinished && traceFinished) {
+        // 关键约束保持不变：
+        // copyIssued 只在 ToCopy.cmd.fire 时置位，所以 Trace 仍只能在 Copy 真正发出后的下一拍或更晚发出。
+        //
+        // Mreq 优化：
+        // 不再等待 Trace issued 才做 monitor 更新。Copy fire 后，Mreq 连续执行
+        // dest header write -> monitor read -> monitor write，与 Trace/Copy completion 并行。
+        when(copyIssuedDone) {
+          when(!slotCtx(i).runtime.writeDestOopPtrDone) {
+            val addr = slotCtx(i).runtime.destOopPtr.resize(MMUAddrWidth)
+            val newAge = nextAge(slotCtx(i).runtime.age)
+            val writeValue = Mux(
+              slotCtx(i).runtime.destRegionAttr(15 downto 8) === 0 && slotCtx(i).configs.markWord(0),
+              replaceAge(slotCtx(i).configs.markWord, newAge),
+              slotCtx(i).configs.markWord
+            )
+
+            issueReq(m, addr, True, U(8), writeValue, False, False, issued) { _ => }
+
+            when(issued) {
+              issued := False
+              slotCtx(i).runtime.writeDestOopPtrDone := True
+            }
+
+          }.elsewhen(needMonitorUpdate && !slotCtx(i).runtime.monitorReadDone) {
+            issueReq(m, monitorMarkAddr(slotCtx(i).configs.markWord), False, U(8), U(0), True, False, issued) { rd =>
+              slotCtx(i).runtime.monitor_mw := rd(GCElementWidth - 1 downto 0)
+              slotCtx(i).runtime.monitorReadDone := True
+            }
+
+          }.elsewhen(needMonitorUpdate && !slotCtx(i).runtime.monitorUpdateDone) {
+            val addr = monitorMarkAddr(slotCtx(i).configs.markWord)
+            val newAge = nextAge(slotCtx(i).runtime.age)
+            val writeValue = replaceAge(slotCtx(i).runtime.monitor_mw, newAge)
+
+            issueDirectWriteWithoutResp(m, addr, U(8), writeValue, RUN_COPY_TRACE) {
+              slotCtx(i).runtime.monitorUpdateDone := True
+            }
+          }
+        }
+
+        when(copyIssuedDone && memoryPostDone && copyFinished && traceFinished) {
           survivorDonePending(i) := True
           survivorDoneOwner(i) := slotCtx(i).configs.owner
           survivorDoneDest(i) := slotCtx(i).runtime.destOopPtr
@@ -871,8 +870,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
     slotIsPlabSelect(i) := slotFsm.isActive(slotFsm.PLAB_SELECT)
     slotIsAllocCache(i) := slotFsm.isActive(slotFsm.ALLOC_CACHE)
-    slotIsSendCopyWork(i) := slotFsm.isActive(slotFsm.SEND_COPY_WORK)
-    slotIsSendTraceWork(i) := slotFsm.isActive(slotFsm.SEND_TRACE_WORK)
+    slotIsRunCopyTrace(i) := slotFsm.isActive(slotFsm.RUN_COPY_TRACE)
   }
 
   for (i <- 0 until 2) {
@@ -995,13 +993,15 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     lockPlab(1, idx)
   }
 
-  // PLAB pointer fill
-  for (j <- 0 until 2) {
-    when(plabPtrFillValid(0) && plabPtrFillIdx(0) === U(j, 1 bits)) {
-      plabCacheBufferPtr(j) := plabPtrFillData(0)
-    } elsewhen(plabPtrFillValid(1) && plabPtrFillIdx(1) === U(j, 1 bits)) {
-      plabCacheBufferPtr(j) := plabPtrFillData(1)
-    }
+  // PLAB pointer pair fill：第一次访问任一 idx 时，同时缓存两个 pointer。
+  val grantPlabPtrPairFill0 = plabPtrPairFillValid(0)
+  val grantPlabPtrPairFill1 = !plabPtrPairFillValid(0) && plabPtrPairFillValid(1)
+
+  when(grantPlabPtrPairFill0 || grantPlabPtrPairFill1) {
+    plabCacheBufferPtr(0) := Mux(grantPlabPtrPairFill0, plabPtrPairFillData0(0), plabPtrPairFillData0(1))
+    plabCacheBufferPtr(1) := Mux(grantPlabPtrPairFill0, plabPtrPairFillData1(0), plabPtrPairFillData1(1))
+    plabCacheBufferPtrValid(0) := True
+    plabCacheBufferPtrValid(1) := True
   }
 
   // PLAB buffer fill
@@ -1110,7 +1110,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val wantCopy = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantCopy(i) := slotValid(i) && slotIsSendCopyWork(i) && !slotCtx(i).runtime.copyIssued
+    wantCopy(i) := slotValid(i) && slotIsRunCopyTrace(i) && !slotCtx(i).runtime.copyIssued
   }
 
   val grantCopy0 = !copyBusy && wantCopy(0) && (!wantCopy(1) || olderSlot === U(0, 1 bits))
@@ -1148,8 +1148,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val wantTrace = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantTrace(i) := slotValid(i) && slotIsSendTraceWork(i) && slotCtx(i).runtime.copyIssued && !slotCtx(i).runtime.traceIssued &&
-        slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
+    // copyIssued 只在 ToCopy.cmd.fire 时置位，因此 Trace 绝不会早于 Copy 请求真正发出。
+    wantTrace(i) := slotValid(i) && slotIsRunCopyTrace(i) && slotCtx(i).runtime.copyIssued &&
+        !slotCtx(i).runtime.traceIssued && slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
   }
 
   val grantTrace0 = !traceBusy && wantTrace(0) && (!wantTrace(1) || olderSlot === U(0, 1 bits))

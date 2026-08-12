@@ -74,10 +74,15 @@ case class GcFetchData() extends Bundle with GCTopParameters with GCParameters w
 //         特殊处理：PartialArrayOop 跳过 OOP 读取，因为 task 本身就是 fromObj
 //   阶段2: 读 MW   — 从 fromObj 地址读取 MarkWord(8B) + KlassPtr(8B) [+可选 Length(4B)]
 //
-// 三条独立 MMU 端口（避免相互阻塞）：
-//   MainMreq — mainFsm 使用，处理 Pop 出的主任务
-//   PushMreq — pushFsm 使用，处理 Trace2Fetch 实时推送
-//   PreMreq  — preFsm 使用，批量预取
+// 六条独立 MMU 端口（均直接连接 GCLocalMMU，不经过 UnalignedAdapter）：
+//   MainMreq — mainFsm 使用，内部完成 Line 对齐/shift/跨 Line 拼接
+//   PushMreq — pushFsm 使用，内部完成 Line 对齐/shift/跨 Line 拼接
+//   PreMreq0..3 — 4 个 prefetch worker 独立使用
+//
+// OOP Line Cache：
+//   只缓存 READ_OOP 的 32B Line；MW/Klass/Length 读取不进入 Cache。
+//   TracePush OOP 为保证 Copy store-buffer forwarding 语义，绕过 Cache。
+//   同 Line cache miss 通过 pending-line/MSHR 合并，避免多个 worker 重复读 LLC。
 //
 // Copy Store-Buffer 转发：
 //   当任务来自 GCTrace（fromTracePush=true）时，目标对象可能正被 Copy 搬运。
@@ -88,9 +93,18 @@ case class GcFetchData() extends Bundle with GCTopParameters with GCParameters w
 // ============================================================================
 class GCFetch extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
+    // Main / Push / Pre0~3 全部直接连接 GCLocalMMU。
+    // GCFetch 内部负责所有 read 的 Line 对齐和 Response 恢复。
     val MainMreq = master(new LocalMMUIO)
     val PushMreq = master(new LocalMMUIO)
-    val PreMreq  = master(new LocalMMUIO)
+
+    // 4 条独立 Prefetch MMU 通道，每个 prefetch worker 独占一条。
+    // 这四条端口直接连接 GCLocalMMU，不再经过 GCUnalignedMMUAdapter。
+    // GCFetch 内部负责 Line 对齐、Response shift 和跨 Line 拼接。
+    val PreMreq0 = master(new LocalMMUIO)
+    val PreMreq1 = master(new LocalMMUIO)
+    val PreMreq2 = master(new LocalMMUIO)
+    val PreMreq3 = master(new LocalMMUIO)
 
     // 与 TaskStack 的接口：
     //   Pop    — 主消费端口，mainFsm 从此获取待处理任务
@@ -111,6 +125,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
     val Fetch2OopProcess   = master(new GCToProcessUnit)
     val ConfigIO           = slave(new GCFetchConfigIO)
+
     val DebugTimeStamp     = in UInt(64 bits)
   }
 
@@ -120,18 +135,103 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     m.Response.ready := False
   }
 
-  // 没有用issuedReq
-  def driveReadReq(m: LocalMMUIO, addr: UInt, sizeBytes: UInt): Unit = {
+  // GCFetch 所有 read 端口统一使用的对齐整 Line 读。
+  // RequestSize 保持 0，与原 UnalignedAdapter 适配读送往 LLC 的语义一致：
+  // 下游根据对齐地址返回完整 ResponseData Line。
+  def driveAlignedLineReadReq(m: LocalMMUIO, alignedAddr: UInt): Unit = {
     m.Request.valid := True
 
     m.Request.payload.NeedResponse        := True
     m.Request.payload.NeedDoCmpxChg       := False
-    m.Request.payload.RequestSize         := sizeBytes.resize(LineBytesNumBitSize)
+    m.Request.payload.RequestSize         := U(0, LineBytesNumBitSize bits)
     m.Request.payload.RequestWStrb        := U(0)
     m.Request.payload.RequestData         := U(0)
     m.Request.payload.RequestType_isWrite := False
     m.Request.payload.RequestSourceID     := m.ConherentRequsetSourceID.payload
-    m.Request.payload.RequestVirtualAddr  := addr
+    m.Request.payload.RequestVirtualAddr  := alignedAddr.resize(MMUAddrWidth)
+  }
+
+  val PreLineOffsetBits = log2Up(LineBytesNum)
+
+  // 将任意逻辑地址向下对齐到 LineBytesNum 边界。
+  def alignToLine(addr: UInt): UInt = {
+    (addr & ~U(LineBytesNum - 1, addr.getWidth bits)).resize(MMUAddrWidth)
+  }
+
+  // 逻辑访问是否跨越 32B Line。
+  def readCrossesLine(addr: UInt, sizeBytes: UInt): Bool = {
+    val off = addr(PreLineOffsetBits - 1 downto 0)
+    val sumWidth = LineBytesNumBitSize + 1
+
+    off.resize(sumWidth) + sizeBytes.resize(sumWidth) >
+      U(LineBytesNum, sumWidth bits)
+  }
+
+  // 单 Line 返回后，把逻辑地址对应的第 0 字节移到 ResponseData bit[7:0]。
+  def shiftLineToLogical(lineData: UInt, offset: UInt): UInt = {
+    lineData |>> (offset << 3)
+  }
+
+  // 跨 Line 逻辑读拼接：
+  //   line0 中 offset..31 放到低位，
+  //   line1 中 0.. 放到其后。
+  def mergeTwoReadLines(line0: UInt, line1: UInt, offset: UInt): UInt = {
+    val firstBytes =
+      U(LineBytesNum, LineBytesNumBitSize + 1 bits) -
+        offset.resize(LineBytesNumBitSize + 1)
+
+    val firstPart =
+      line0 |>> (offset << 3)
+
+    val secondPart =
+      line1 |<< (firstBytes << 3)
+
+    firstPart | secondPart
+  }
+
+  // 跨 Line 两个 response 的归属判断。
+  //
+  // 不能假设 beat0 / beat1 一定得到不同 SourceID：
+  // 当前下层可能连续给同一 LocalMMUIO 的两个 request 分配同一个 SourceID。
+  //
+  // 处理规则：
+  //   1. SourceID 不同：按 ID 匹配，可乱序返回；
+  //   2. SourceID 相同：优先填尚未收到的 beat0，下一次同 ID response 再填 beat1。
+  //
+  // 因此即使 src0 == src1，也不会让同一个 response 同时命中两个 beat。
+  //
+  // 注意：当两个 request 的 SourceID 相同时，这依赖下层对同 SourceID response
+  // 保持请求顺序。如果下层允许“相同 SourceID 仍乱序返回”，仅凭当前 Response
+  // 接口无法区分两个 transaction，此时必须让下层分配不同 SourceID 或改回串行。
+  def classifyTwoLineResp(
+      respFire: Bool,
+      respSid: UInt,
+      src0: UInt,
+      src1: UInt,
+      src1Valid: Bool,
+      resp0Valid: Bool,
+      resp1Valid: Bool
+  ): (Bool, Bool) = {
+    val match0 =
+      respFire &&
+        !resp0Valid &&
+        respSid === src0
+
+    val match1 =
+      respFire &&
+        src1Valid &&
+        !resp1Valid &&
+        respSid === src1
+
+    // 如果 src0 == src1 且两个 beat 都没收到，本次 response 只归 beat0。
+    val take0 =
+      match0
+
+    val take1 =
+      match1 &&
+        !match0
+
+    (take0, take1)
   }
 
   // 辅助函数：Copy Store-Buffer 转发查询
@@ -171,7 +271,19 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
   clearMreq(io.MainMreq)
   clearMreq(io.PushMreq)
-  clearMreq(io.PreMreq)
+  clearMreq(io.PreMreq0)
+  clearMreq(io.PreMreq1)
+  clearMreq(io.PreMreq2)
+  clearMreq(io.PreMreq3)
+
+  // Scala 侧静态数组，仅用于 generate-time 的 for 循环。
+  // worker i 永远绑定 PreMreq{i}。
+  val preMreqs = Seq(
+    io.PreMreq0,
+    io.PreMreq1,
+    io.PreMreq2,
+    io.PreMreq3
+  )
 
   io.toFetch.Pop.ready    := False
   io.toFetch.PrePop.ready := False
@@ -317,6 +429,156 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val push_data = RegInit(GcFetchData().getZero)
 
   // ============================================================================
+  // Main / Push direct-Line read metadata
+  //
+  // 一个逻辑 read 最多拆成两个 32B Line request。
+  // 对 cross-line 情况，REQ0 fire 后下一拍立即尝试 REQ1，不等待 RESP0。
+  // 两个 Response 通过各自 RequestSourceID 匹配，因此允许乱序返回。
+  // ============================================================================
+  val mainOopOffset = RegInit(U(0, PreLineOffsetBits bits))
+  val mainOopCross  = RegInit(False)
+  val mainMwOffset  = RegInit(U(0, PreLineOffsetBits bits))
+  val mainMwCross   = RegInit(False)
+
+  val mainLineSrc0 = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  val mainLineSrc1 = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  val mainLineSrc1Valid = RegInit(False)
+  val mainLineResp0Valid = RegInit(False)
+  val mainLineResp1Valid = RegInit(False)
+  val mainLineData0 = RegInit(U(0, MMUDataWidth bits))
+  val mainLineData1 = RegInit(U(0, MMUDataWidth bits))
+
+  val pushOopOffset = RegInit(U(0, PreLineOffsetBits bits))
+  val pushOopCross  = RegInit(False)
+  val pushMwOffset  = RegInit(U(0, PreLineOffsetBits bits))
+  val pushMwCross   = RegInit(False)
+
+  val pushLineSrc0 = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  val pushLineSrc1 = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  val pushLineSrc1Valid = RegInit(False)
+  val pushLineResp0Valid = RegInit(False)
+  val pushLineResp1Valid = RegInit(False)
+  val pushLineData0 = RegInit(U(0, MMUDataWidth bits))
+  val pushLineData1 = RegInit(U(0, MMUDataWidth bits))
+
+  // ============================================================================
+  // READ_OOP-only 8-entry Line Cache
+  //
+  // * 全相联，tag = 32B aligned address，data = 256-bit Line。
+  // * Main / Push / Pre0~3 共享 lookup。
+  // * 仅普通（!fromTracePush）且单-Line 的 8B OOP read 使用 Cache。
+  // * MW/Klass/Length 永远 bypass Cache。
+  // * TracePush OOP 必须先走 Copy store-buffer forwarding，因此 bypass Cache。
+  // ============================================================================
+  val OopLineCacheEntries  = 8
+  val OopLineCacheIdxWidth = log2Up(OopLineCacheEntries)
+
+  val oopLineCacheValid = Vec.fill(OopLineCacheEntries)(RegInit(False))
+  val oopLineCacheTag = Vec.fill(OopLineCacheEntries)(
+    RegInit(U(0, MMUAddrWidth bits))
+  )
+  val oopLineCacheData = Vec.fill(OopLineCacheEntries)(
+    RegInit(U(0, MMUDataWidth bits))
+  )
+  val oopLineCacheReplacePtr =
+    RegInit(U(0, OopLineCacheIdxWidth bits))
+
+  def lookupOopLineCache(lineAddr: UInt): (Bool, UInt) = {
+    val hitVec = Bits(OopLineCacheEntries bits)
+
+    for (i <- 0 until OopLineCacheEntries) {
+      hitVec(i) :=
+        oopLineCacheValid(i) &&
+          oopLineCacheTag(i) === lineAddr.resize(MMUAddrWidth)
+    }
+
+    val hit = hitVec.orR
+    val hitData = UInt(MMUDataWidth bits)
+
+    hitData := U(0, MMUDataWidth bits)
+
+    when(hit) {
+      hitData :=
+        PriorityMux(
+          (0 until OopLineCacheEntries).map(i =>
+            (hitVec(i), oopLineCacheData(i))
+          )
+        )
+    }
+
+    (hit, hitData)
+  }
+
+  // ============================================================================
+  // OOP pending-line table / lightweight MSHR
+  //
+  // 每个可发 OOP Line request 的 source 固定拥有一个 pending entry：
+  //   0 = Main
+  //   1 = Push
+  //   2 = PreWorker0
+  //   3 = PreWorker1
+  //   4 = PreWorker2
+  //   5 = PreWorker3
+  //
+  // 同 Line miss coalescing：
+  //   新 miss 先经过每拍一个的 issue arbiter，解决同拍重复 miss；
+  //   cache miss + pending hit -> 不重复发 LLC request，停在 OOP_REQ0 重试；
+  //   owner response 返回     -> pendingReady=1；
+  //   fill arbiter 每拍将一个 ready entry 写入 Cache 并释放 pending；
+  //   waiter 下一拍 lookup Cache 命中继续。
+  //
+  // 这样不需要 waiter bitmap，也不会因为同时 4 个 worker miss 同一 Line
+  // 而重复产生 4 次 LLC read。
+  // ============================================================================
+  val OopPendingNum      = 6
+  val OopPendingIdxWidth = log2Up(OopPendingNum)
+
+  val oopPendingValid = Vec.fill(OopPendingNum)(RegInit(False))
+  val oopPendingReady = Vec.fill(OopPendingNum)(RegInit(False))
+  val oopPendingLineAddr = Vec.fill(OopPendingNum)(
+    RegInit(U(0, MMUAddrWidth bits))
+  )
+  val oopPendingLineData = Vec.fill(OopPendingNum)(
+    RegInit(U(0, MMUDataWidth bits))
+  )
+
+  def lookupOopPending(lineAddr: UInt): Bool = {
+    val hitVec = Bits(OopPendingNum bits)
+
+    for (i <- 0 until OopPendingNum) {
+      hitVec(i) :=
+        oopPendingValid(i) &&
+          oopPendingLineAddr(i) === lineAddr.resize(MMUAddrWidth)
+    }
+
+    hitVec.orR
+  }
+
+  // 同一拍的多个 Cache miss 看不到彼此本拍将写入的 pendingValid。
+  // 因此新 OOP Cache miss 统一经过一个 6->1 issue arbiter：
+  // 每拍最多建立一个新的 pending Line，下一拍开始其它 source 就能 pending-hit。
+  //
+  // 这不会把 OOP MLP 压成 1：不同 Line 仍可连续每拍各发一个 request，
+  // 很快形成多个 outstanding；只是避免同一拍重复 miss。
+  val oopMissWant =
+    Bits(OopPendingNum bits)
+
+  oopMissWant :=
+    B(0, OopPendingNum bits)
+
+  val oopMissGrant =
+    Bits(OopPendingNum bits)
+
+  oopMissGrant(0) :=
+    oopMissWant(0)
+
+  for (i <- 1 until OopPendingNum) {
+    oopMissGrant(i) :=
+      oopMissWant(i) &&
+        !oopMissWant(i - 1 downto 0).orR
+  }
+
+  // ============================================================================
   // Copy 部分转发寄存器
   //
   // 当 MMU 读请求发送时，采样 Copy 返回的 mask/data。
@@ -327,8 +589,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val mainFwdData = RegInit(U(0, MMUDataWidth bits))
   val pushFwdMask = RegInit(B(0, LineBytesNum bits))
   val pushFwdData = RegInit(U(0, MMUDataWidth bits))
-  val preFwdMask  = RegInit(B(0, LineBytesNum bits))
-  val preFwdData  = RegInit(U(0, MMUDataWidth bits))
 
   // ============================================================================
   // PreFetch 环形缓冲区
@@ -351,7 +611,17 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   //   3. mainFsm Pop 到已完成条目 → 从 buf_bottom 取出，buf_count--
   // ============================================================================
   val preBuf = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
-  val preBufDone = Vec.fill(PreFetchBufferNum)(RegInit(False))
+
+  // preBufValid:
+  //   False -> FREE，allocator 可以重新分配
+  //   True  -> slot 已经属于当前 prefetch window；无论 worker 是否已经 Done，
+  //            在 Main 真正消费/显式覆盖前都不能被 Normal allocator 复用
+  //
+  // preBufDone:
+  //   valid=1, done=0 -> INFLIGHT
+  //   valid=1, done=1 -> READY，等待 Main 消费
+  val preBufValid = Vec.fill(PreFetchBufferNum)(RegInit(False))
+  val preBufDone  = Vec.fill(PreFetchBufferNum)(RegInit(False))
 
   val buf_top = RegInit(U(0, PreFetchBufferWidth bits))
   val buf_bottom = RegInit(U(0, PreFetchBufferWidth bits))
@@ -360,7 +630,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val buf_capacity = U(PreFetchBufferNum, PreFetchBufferWidth + 1 bits)
   val buf_free = buf_capacity - buf_count
 
-  val buf_work = RegInit(U(0, PreFetchBufferWidth bits))
 
   // pushFollowRem — Push-follow 模式下剩余待 PrePop 的任务数
   //
@@ -376,7 +645,12 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
   def bufInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
   def bufDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
-  def resetSlot(idx: UInt): Unit = preBufDone(idx) := False
+
+  // 只有 Main 真正消费 slot 后，Normal allocator 才能重新使用它。
+  def releaseSlot(idx: UInt): Unit = {
+    preBufValid(idx) := False
+    preBufDone(idx)  := False
+  }
 
   val mainIsIdle     = Bool()
   val mainIsWaitDone = Bool()
@@ -399,9 +673,12 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     targetDoneSeen := True
   }
 
-  // mainFsm Pop 到预取条目但 preFsm 尚未完成该条目的 OOP+MW 读取，
-  // 此时需要等待 preFsm 完成 buf_bottom 对应的条目
+  // mainFsm Pop 到预取条目但 worker 尚未完成时，锁存“具体 slot + task”。
+  // 后续不能继续用实时 buf_bottom 作为唯一依据，否则 buf_bottom/slot 被其它
+  // 控制路径修改时可能消费到另一个 generation 的数据。
   val waitForPrefetch = RegInit(False)
+  val waitPrefetchSlot = RegInit(U(0, PreFetchBufferWidth bits))
+  val waitPrefetchTask = RegInit(U(0, GCElementWidth bits))
 
   // ============================================================================
   // MarkWord 转发缓存（Forwarding Cache）
@@ -474,309 +751,1193 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   }
 
   // ============================================================================
-  // Main StateMachine — 主任务处理流水线
+  // Main StateMachine
   //
-  // 状态流转（以普通对象为例）：
-  //   IDLE ─Pop.fire──> READ_OOP_REQ ──> READ_OOP_RESP ──> READ_MW_REQ
-  //     ^                                                    │
-  //     │                                                    v
-  //   WAIT_DONE <────────────── SEND <──────────────── READ_MW_RESP
+  // OOP:
+  //   Cache hit -> 直接 decode
+  //   Cache miss + pending hit -> 原地等待 owner fill Cache
+  //   Cache miss + pending miss -> 发 Line0，并建立 pending[Main]
   //
-  // IDLE 特殊路径：
-  //   — 如果 Pop 到的任务在预取缓冲中已完成（preBufDone=True）：
-  //     直接 goto(SEND)，跳过所有 MMU 读取
-  //   — 如果 Pop 到的任务在预取缓冲中但尚未完成：
-  //     设置 waitForPrefetch=True，等待 preFsm 完成
+  // Cross-line:
+  //   REQ0.fire -> 下一拍 REQ1，不等待 RESP0；
+  //   WAIT 中按 SourceID 收集两个 Response，可乱序返回。
   // ============================================================================
   val mainFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
-    val READ_OOP_REQ  = new State   // 等待 Copy 转发或发出 OOP 读取请求
-    val READ_OOP_RESP = new State   // 等待 OOP 读取的 MMU 响应
-    val READ_MW_REQ   = new State   // 等待 Copy 转发或发出 MarkWord+Klass+Len 读取请求
-    val READ_MW_RESP  = new State   // 等待 MarkWord 读取的 MMU 响应
-    val SEND          = new State   // 向 ArrayProcess 或 OopProcess 分发任务
-    val WAIT_DONE     = new State   // 等待下游处理单元完成
+    val READ_OOP_REQ0 = new State
+    val READ_OOP_REQ1 = new State
+    val READ_OOP_WAIT = new State
+    val READ_MW_REQ0  = new State
+    val READ_MW_REQ1  = new State
+    val READ_MW_WAIT  = new State
+    val SEND          = new State
+    val WAIT_DONE     = new State
 
     IDLE.whenIsActive {
-      // Pop 允许条件（所有条件同时满足）：
-      //   1. pushFsm 空闲（不在处理 Trace2Fetch 任务）
-      //   2. 没有 Trace2Fetch 待处理（优先处理实时推送）
-      //   3. 没有等待预取完成
-      //   4. pushFollowRem == 0（不在 Push-follow 模式中）
-      val fetchPushFollowActive = pushFollowRem =/= U(0, 32 bits)
-      io.toFetch.Pop.ready := pushIsIdle && !io.Trace2Fetch.valid && !waitForPrefetch && !fetchPushFollowActive
+      val fetchPushFollowActive =
+        pushFollowRem =/= U(0, 32 bits)
+
+      io.toFetch.Pop.ready :=
+        pushIsIdle &&
+          !io.Trace2Fetch.valid &&
+          !waitForPrefetch &&
+          !fetchPushFollowActive
 
       when(io.toFetch.Pop.fire) {
-        val popBase = taskBaseFromPayload(io.toFetch.Pop.payload)
-        val bottomValid = buf_count =/= U(0, buf_count.getWidth bits)
-        val bottomHit = bottomValid && preBuf(buf_bottom).task === popBase
+        val popBase =
+          taskBaseFromPayload(io.toFetch.Pop.payload)
 
-        // 场景1: 预取缓冲命中 + 已完成 → 直接分发，跳过 MMU 读取
+        val bottomCountValid =
+          buf_count =/= U(0, buf_count.getWidth bits)
+
+        val bottomValid =
+          bottomCountValid &&
+            preBufValid(buf_bottom)
+
+        val bottomHit =
+          bottomValid &&
+            preBuf(buf_bottom).task === popBase
+
         when(bottomHit && preBufDone(buf_bottom)) {
-          main_data := preBuf(buf_bottom)
+          main_data :=
+            preBuf(buf_bottom)
 
-          resetSlot(buf_bottom)
-          buf_bottom := bufInc(buf_bottom, U(1, PreFetchBufferWidth bits))
-          buf_count := buf_count - U(1, buf_count.getWidth bits)
+          releaseSlot(buf_bottom)
+
+          buf_bottom :=
+            bufInc(
+              buf_bottom,
+              U(1, PreFetchBufferWidth bits)
+            )
+
+          buf_count :=
+            buf_count -
+              U(1, buf_count.getWidth bits)
 
           goto(SEND)
 
-        // 场景2: 预取缓冲命中但尚未完成 → 等待 preFsm
         }.elsewhen(bottomHit) {
-          waitForPrefetch := True
+          waitForPrefetch :=
+            True
 
-        // 场景3: 预取缓冲未命中 → 执行完整的 OOP+MW 读取流程
+          waitPrefetchSlot :=
+            buf_bottom
+
+          waitPrefetchTask :=
+            popBase
+
         }.otherwise {
-          receiveTask(io.toFetch.Pop.payload, main_data)
-          main_data.fromObj := U(0)
-          goto(READ_OOP_REQ)
+          receiveTask(
+            io.toFetch.Pop.payload,
+            main_data
+          )
+
+          main_data.fromObj :=
+            U(0, GCElementWidth bits)
+
+          goto(READ_OOP_REQ0)
         }
 
-      // 场景4: waitForPrefetch 等待的条目已完成 → 直接分发
       }.elsewhen(
         waitForPrefetch &&
-          buf_count =/= U(0, buf_count.getWidth bits) &&
-          preBufDone(buf_bottom)
+          preBufValid(waitPrefetchSlot) &&
+          preBuf(waitPrefetchSlot).task === waitPrefetchTask &&
+          preBufDone(waitPrefetchSlot)
       ) {
-        waitForPrefetch := False
-        main_data       := preBuf(buf_bottom)
+        waitForPrefetch :=
+          False
 
-        resetSlot(buf_bottom)
-        buf_bottom := bufInc(buf_bottom,U(1, PreFetchBufferWidth bits))
-        buf_count := buf_count - U(1, buf_count.getWidth bits)
+        main_data :=
+          preBuf(waitPrefetchSlot)
+
+        releaseSlot(waitPrefetchSlot)
+
+        buf_bottom :=
+          bufInc(
+            waitPrefetchSlot,
+            U(1, PreFetchBufferWidth bits)
+          )
+
+        buf_count :=
+          buf_count -
+            U(1, buf_count.getWidth bits)
 
         goto(SEND)
       }
     }
 
-    // READ_OOP_REQ — 阶段1：读取 OOP（8字节），解码得到 fromObj
-    //
-    // PartialArrayOop 快速路径：
-    //   task 本身就是 fromObj，跳过 OOP 读取，直接进入 READ_MW_REQ。
-    //
-    // 普通对象路径：
-    //   先查询 Copy store-buffer（driveCopyFwd）：
-    //     — fullFwd（完全命中）：直接用 Copy 数据解码 fromObj → READ_MW_REQ
-    //     — 部分命中/未命中：发送 MMU 读请求 → READ_OOP_RESP
-    //     — stall：Copy 正在传输中，等待
-    READ_OOP_REQ.whenIsActive {
-      // PartialArrayOop: task 就是 fromObj，跳过 OOP 读取
+    // ------------------------------------------------------------------------
+    // OOP REQ0
+    // ------------------------------------------------------------------------
+    READ_OOP_REQ0.whenIsActive {
       when(main_data.oopType === U(PartialArrayOop)) {
-        main_data.fromObj := main_data.task
+        main_data.fromObj :=
+          main_data.task
 
-        goto(READ_MW_REQ)
+        goto(READ_MW_REQ0)
 
       }.otherwise {
-        driveCopyFwd(io.CopyFwdMain, main_data.task, oopReadSize, main_data.oopCopyMeta)
+        val oopAddr =
+          main_data.task
 
-        val reqMask = requestedByteMask(oopReadSize)
-        val fullFwd = (io.CopyFwdMain.mask & reqMask) === reqMask
+        val line0Addr =
+          alignToLine(oopAddr)
+
+        val offsetNow =
+          oopAddr(PreLineOffsetBits - 1 downto 0)
+
+        val crossNow =
+          readCrossesLine(
+            oopAddr,
+            oopReadSize
+          )
+
+        val cacheEligible =
+          !main_data.oopCopyMeta.needQuery &&
+            !crossNow
+
+        val (cacheHit, cacheLine) =
+          lookupOopLineCache(line0Addr)
+
+        val pendingHit =
+          lookupOopPending(line0Addr)
+
+        val ownPendingFree =
+          !oopPendingValid(0)
+
+        val newCacheMiss =
+          cacheEligible &&
+            !cacheHit &&
+            !pendingHit &&
+            ownPendingFree
+
+        when(newCacheMiss) {
+          oopMissWant(0) :=
+            True
+        }
+
+        driveCopyFwd(
+          io.CopyFwdMain,
+          oopAddr,
+          oopReadSize,
+          main_data.oopCopyMeta
+        )
+
+        val reqMask =
+          requestedByteMask(oopReadSize)
+
+        val fullFwd =
+          main_data.oopCopyMeta.needQuery &&
+            (io.CopyFwdMain.mask & reqMask) === reqMask
 
         when(!io.CopyFwdMain.stall) {
           when(fullFwd) {
-            val newFromObj = decodeReadOopResp(io.CopyFwdMain.data)
+            main_data.fromObj :=
+              decodeReadOopResp(
+                io.CopyFwdMain.data
+              )
 
-            main_data.fromObj := newFromObj
+            goto(READ_MW_REQ0)
 
-            goto(READ_MW_REQ)
+          }.elsewhen(cacheEligible && cacheHit) {
+            val logicalData =
+              shiftLineToLogical(
+                cacheLine,
+                offsetNow
+              )
 
-          }.otherwise {
-            driveReadReq(io.MainMreq, main_data.task, oopReadSize)
+            main_data.fromObj :=
+              decodeReadOopResp(logicalData)
+
+            goto(READ_MW_REQ0)
+
+          }.elsewhen(cacheEligible && pendingHit) {
+            // 同一 Line 已经在飞：不重复发请求。
+            // owner fill Cache 后，本状态下一拍自动 cache hit。
+          }.elsewhen(
+            !cacheEligible ||
+              (newCacheMiss && oopMissGrant(0))
+          ) {
+            driveAlignedLineReadReq(
+              io.MainMreq,
+              line0Addr
+            )
 
             when(io.MainMreq.Request.fire) {
-              mainFwdMask := io.CopyFwdMain.mask
-              mainFwdData := io.CopyFwdMain.data
-              goto(READ_OOP_RESP)
+              mainOopOffset :=
+                offsetNow
+
+              mainOopCross :=
+                crossNow
+
+              mainFwdMask :=
+                io.CopyFwdMain.mask
+
+              mainFwdData :=
+                io.CopyFwdMain.data
+
+              mainLineSrc0 :=
+                io.MainMreq.Request.payload.RequestSourceID.resized
+
+              mainLineSrc1Valid :=
+                False
+
+              mainLineResp0Valid :=
+                False
+
+              mainLineResp1Valid :=
+                False
+
+              when(cacheEligible) {
+                oopPendingValid(0) :=
+                  True
+
+                oopPendingReady(0) :=
+                  False
+
+                oopPendingLineAddr(0) :=
+                  line0Addr
+              }
+
+              when(crossNow) {
+                goto(READ_OOP_REQ1)
+
+              }.otherwise {
+                goto(READ_OOP_WAIT)
+              }
             }
           }
         }
       }
     }
 
-    READ_OOP_RESP.whenIsActive {
-      io.MainMreq.Response.ready := True
+    // ------------------------------------------------------------------------
+    // OOP REQ1
+    // ------------------------------------------------------------------------
+    READ_OOP_REQ1.whenIsActive {
+      val line1Addr =
+        (
+          alignToLine(main_data.task) +
+            U(LineBytesNum, MMUAddrWidth bits)
+        ).resize(MMUAddrWidth)
+
+      driveAlignedLineReadReq(
+        io.MainMreq,
+        line1Addr
+      )
+
+      // RESP0 可能在 REQ1 尚未 fire 时提前回来。
+      io.MainMreq.Response.ready :=
+        True
 
       when(io.MainMreq.Response.fire) {
-        val rd = mergeCopyForward(io.MainMreq.Response.payload.ResponseData, mainFwdMask, mainFwdData)
-        val newFromObj = decodeReadOopResp(rd)
+        val respSid =
+          io.MainMreq.Response.payload.ResponseSourceID.resized
 
-        main_data.fromObj := newFromObj
+        when(
+          !mainLineResp0Valid &&
+            respSid === mainLineSrc0
+        ) {
+          mainLineData0 :=
+            io.MainMreq.Response.payload.ResponseData
 
-        goto(READ_MW_REQ)
+          mainLineResp0Valid :=
+            True
+        }
+      }
+
+      when(io.MainMreq.Request.fire) {
+        mainLineSrc1 :=
+          io.MainMreq.Request.payload.RequestSourceID.resized
+
+        mainLineSrc1Valid :=
+          True
+
+        goto(READ_OOP_WAIT)
       }
     }
 
-    READ_MW_REQ.whenIsActive {
-      driveReadReq(
+    // ------------------------------------------------------------------------
+    // OOP WAIT
+    // ------------------------------------------------------------------------
+    READ_OOP_WAIT.whenIsActive {
+      io.MainMreq.Response.ready :=
+        True
+
+      val respFire =
+        io.MainMreq.Response.fire
+
+      val respSid =
+        io.MainMreq.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          mainLineSrc0,
+          mainLineSrc1,
+          mainLineSrc1Valid,
+          mainLineResp0Valid,
+          mainLineResp1Valid
+        )
+
+      when(respIs0) {
+        mainLineData0 :=
+          io.MainMreq.Response.payload.ResponseData
+
+        mainLineResp0Valid :=
+          True
+      }
+
+      when(respIs1) {
+        mainLineData1 :=
+          io.MainMreq.Response.payload.ResponseData
+
+        mainLineResp1Valid :=
+          True
+      }
+
+      val got0Now =
+        mainLineResp0Valid || respIs0
+
+      val got1Now =
+        !mainOopCross ||
+          mainLineResp1Valid ||
+          respIs1
+
+      val line0Now =
+        Mux(
+          respIs0,
+          io.MainMreq.Response.payload.ResponseData,
+          mainLineData0
+        )
+
+      val line1Now =
+        Mux(
+          respIs1,
+          io.MainMreq.Response.payload.ResponseData,
+          mainLineData1
+        )
+
+      when(got0Now && got1Now) {
+        val memoryLogical =
+          Mux(
+            mainOopCross,
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              mainOopOffset
+            ),
+            shiftLineToLogical(
+              line0Now,
+              mainOopOffset
+            )
+          )
+
+        val logicalData =
+          mergeCopyForward(
+            memoryLogical,
+            mainFwdMask,
+            mainFwdData
+          )
+
+        // 只有普通单-Line OOP miss 建立了 pending[0]。
+        // Response 先落 pendingReady，Cache fill arbiter 后续写 Cache。
+        when(oopPendingValid(0)) {
+          oopPendingLineData(0) :=
+            line0Now
+
+          oopPendingReady(0) :=
+            True
+        }
+
+        main_data.fromObj :=
+          decodeReadOopResp(logicalData)
+
+        goto(READ_MW_REQ0)
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // MW REQ0
+    // ------------------------------------------------------------------------
+    READ_MW_REQ0.whenIsActive {
+      val mwAddr =
+        main_data.fromObj
+
+      val line0Addr =
+        alignToLine(mwAddr)
+
+      val offsetNow =
+        mwAddr(PreLineOffsetBits - 1 downto 0)
+
+      val crossNow =
+        readCrossesLine(
+          mwAddr,
+          mwReadSize
+        )
+
+      driveAlignedLineReadReq(
         io.MainMreq,
-        main_data.fromObj,
-        mwReadSize
+        line0Addr
       )
 
       when(io.MainMreq.Request.fire) {
-        goto(READ_MW_RESP)
+        mainMwOffset :=
+          offsetNow
+
+        mainMwCross :=
+          crossNow
+
+        mainLineSrc0 :=
+          io.MainMreq.Request.payload.RequestSourceID.resized
+
+        mainLineSrc1Valid :=
+          False
+
+        mainLineResp0Valid :=
+          False
+
+        mainLineResp1Valid :=
+          False
+
+        when(crossNow) {
+          goto(READ_MW_REQ1)
+
+        }.otherwise {
+          goto(READ_MW_WAIT)
+        }
       }
     }
 
-    READ_MW_RESP.whenIsActive {
-      io.MainMreq.Response.ready := True
+    // ------------------------------------------------------------------------
+    // MW REQ1
+    // ------------------------------------------------------------------------
+    READ_MW_REQ1.whenIsActive {
+      val line1Addr =
+        (
+          alignToLine(main_data.fromObj) +
+            U(LineBytesNum, MMUAddrWidth bits)
+        ).resize(MMUAddrWidth)
+
+      driveAlignedLineReadReq(
+        io.MainMreq,
+        line1Addr
+      )
+
+      // 不阻塞提前返回的 RESP0。
+      io.MainMreq.Response.ready :=
+        True
 
       when(io.MainMreq.Response.fire) {
-        fillMwKlassLen(io.MainMreq.Response.payload.ResponseData, main_data)
+        val respSid =
+          io.MainMreq.Response.payload.ResponseSourceID.resized
+
+        when(
+          !mainLineResp0Valid &&
+            respSid === mainLineSrc0
+        ) {
+          mainLineData0 :=
+            io.MainMreq.Response.payload.ResponseData
+
+          mainLineResp0Valid :=
+            True
+        }
+      }
+
+      when(io.MainMreq.Request.fire) {
+        mainLineSrc1 :=
+          io.MainMreq.Request.payload.RequestSourceID.resized
+
+        mainLineSrc1Valid :=
+          True
+
+        goto(READ_MW_WAIT)
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // MW WAIT
+    // ------------------------------------------------------------------------
+    READ_MW_WAIT.whenIsActive {
+      io.MainMreq.Response.ready :=
+        True
+
+      val respFire =
+        io.MainMreq.Response.fire
+
+      val respSid =
+        io.MainMreq.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          mainLineSrc0,
+          mainLineSrc1,
+          mainLineSrc1Valid,
+          mainLineResp0Valid,
+          mainLineResp1Valid
+        )
+
+      when(respIs0) {
+        mainLineData0 :=
+          io.MainMreq.Response.payload.ResponseData
+
+        mainLineResp0Valid :=
+          True
+      }
+
+      when(respIs1) {
+        mainLineData1 :=
+          io.MainMreq.Response.payload.ResponseData
+
+        mainLineResp1Valid :=
+          True
+      }
+
+      val got0Now =
+        mainLineResp0Valid || respIs0
+
+      val got1Now =
+        !mainMwCross ||
+          mainLineResp1Valid ||
+          respIs1
+
+      val line0Now =
+        Mux(
+          respIs0,
+          io.MainMreq.Response.payload.ResponseData,
+          mainLineData0
+        )
+
+      val line1Now =
+        Mux(
+          respIs1,
+          io.MainMreq.Response.payload.ResponseData,
+          mainLineData1
+        )
+
+      when(got0Now && got1Now) {
+        val rd =
+          Mux(
+            mainMwCross,
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              mainMwOffset
+            ),
+            shiftLineToLogical(
+              line0Now,
+              mainMwOffset
+            )
+          )
+
+        fillMwKlassLen(
+          rd,
+          main_data
+        )
+
         goto(SEND)
       }
     }
 
     SEND.whenIsActive {
-      val isOop = main_data.oopType === U(NotArrayOop)
-      val dispatchMarkWord = resolveForwardMark(main_data.fromObj, main_data.markWord)
+      val isOop =
+        main_data.oopType === U(NotArrayOop)
+
+      val dispatchMarkWord =
+        resolveForwardMark(
+          main_data.fromObj,
+          main_data.markWord
+        )
 
       when(isOop) {
-        driveProcessUnit(io.Fetch2OopProcess, main_data, dispatchMarkWord)
+        driveProcessUnit(
+          io.Fetch2OopProcess,
+          main_data,
+          dispatchMarkWord
+        )
+
       }.otherwise {
-        driveProcessUnit(io.Fetch2ArrayProcess, main_data, dispatchMarkWord)
+        driveProcessUnit(
+          io.Fetch2ArrayProcess,
+          main_data,
+          dispatchMarkWord
+        )
       }
 
-      val unitFire = Mux(
-        isOop,
-        io.Fetch2OopProcess.cmd.fire,
-        io.Fetch2ArrayProcess.cmd.fire
-      )
+      val unitFire =
+        Mux(
+          isOop,
+          io.Fetch2OopProcess.cmd.fire,
+          io.Fetch2ArrayProcess.cmd.fire
+        )
 
       when(unitFire) {
         goto(WAIT_DONE)
 
-        dbg(Seq("Dispatch Task=", main_data.task, " OopType=", main_data.oopType, " SrcOopPtr=", main_data.fromObj, " MarkWord=", dispatchMarkWord, " KlassPtr=", main_data.klassPtr, " success!"))
+        dbg(
+          Seq(
+            "Dispatch Task=",
+            main_data.task,
+            " OopType=",
+            main_data.oopType,
+            " SrcOopPtr=",
+            main_data.fromObj,
+            " MarkWord=",
+            dispatchMarkWord,
+            " KlassPtr=",
+            main_data.klassPtr,
+            " success!"
+          )
+        )
       }
     }
 
     WAIT_DONE.whenIsActive {
       when(targetDone || targetDoneSeen) {
-        targetDoneSeen := False
+        targetDoneSeen :=
+          False
+
         goto(IDLE)
 
-        dbg(Seq("Task=", main_data.task, " done"))
+        dbg(
+          Seq(
+            "Task=",
+            main_data.task,
+            " done"
+          )
+        )
       }
     }
 
     always {
       when(mainGotoSend) {
         goto(SEND)
+
       }.elsewhen(mainGotoReadOop) {
-        goto(READ_OOP_REQ)
+        goto(READ_OOP_REQ0)
       }
     }
   }
 
   // ============================================================================
-  // Push StateMachine — 处理 GCTrace 实时推送的任务
+  // Push StateMachine
   //
-  // 与 mainFsm 的交互：
-  //   — mainFsm 空闲时：直接将 Trace2Fetch 任务接管到 main_data，
-  //     通过 mainGotoReadOop 旁路信号让 mainFsm 跳转到 READ_OOP_REQ
-  //   — mainFsm 忙碌时：在 push_data 中独立完成 OOP+MW 读取，
-  //     完成后将上下文迁移到 main_data（等待 mainFsm 空闲）
-  //
-  // 状态：IDLE → READ_OOP_REQ → READ_OOP_RESP → READ_MW_REQ
-  //                                            → READ_MW_RESP → SEND
-  // 处理流程与 mainFsm 的普通对象路径完全对等，只是使用独立的 pushFsm 资源。
+  // PushMreq 同样支持 cross-line 两个请求 back-to-back。
+  // TracePush OOP 通常 needQuery=True，因此正常绕过 OOP Cache/MSHR。
   // ============================================================================
   val pushFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
-    val READ_OOP_REQ  = new State
-    val READ_OOP_RESP = new State
-    val READ_MW_REQ   = new State
-    val READ_MW_RESP  = new State
+    val READ_OOP_REQ0 = new State
+    val READ_OOP_REQ1 = new State
+    val READ_OOP_WAIT = new State
+    val READ_MW_REQ0  = new State
+    val READ_MW_REQ1  = new State
+    val READ_MW_WAIT  = new State
     val SEND          = new State
 
     IDLE.whenIsActive {
-      io.Trace2Fetch.ready := True
+      io.Trace2Fetch.ready :=
+        True
 
       when(io.Trace2Fetch.fire) {
-        val payload = io.Trace2Fetch.payload
+        val payload =
+          io.Trace2Fetch.payload
 
         when(mainIsIdle) {
-          receiveTask(payload, main_data)
-          main_data.fromObj := U(0)
-          mainGotoReadOop   := True
+          receiveTask(
+            payload,
+            main_data
+          )
+
+          main_data.fromObj :=
+            U(0, GCElementWidth bits)
+
+          mainGotoReadOop :=
+            True
 
         }.otherwise {
-          receiveTask(payload, push_data)
-          push_data.fromObj := U(0)
-          goto(READ_OOP_REQ)
+          receiveTask(
+            payload,
+            push_data
+          )
+
+          push_data.fromObj :=
+            U(0, GCElementWidth bits)
+
+          goto(READ_OOP_REQ0)
         }
       }
     }
 
-    READ_OOP_REQ.whenIsActive {
+    READ_OOP_REQ0.whenIsActive {
       when(push_data.oopType === U(PartialArrayOop)) {
-        push_data.fromObj := push_data.task
+        push_data.fromObj :=
+          push_data.task
 
-        goto(READ_MW_REQ)
+        goto(READ_MW_REQ0)
 
       }.otherwise {
-        driveCopyFwd(io.CopyFwdPush, push_data.task, oopReadSize, push_data.oopCopyMeta)
+        val oopAddr =
+          push_data.task
 
-        val reqMask = requestedByteMask(oopReadSize)
-        val fullFwd = (io.CopyFwdPush.mask & reqMask) === reqMask
+        val line0Addr =
+          alignToLine(oopAddr)
+
+        val offsetNow =
+          oopAddr(PreLineOffsetBits - 1 downto 0)
+
+        val crossNow =
+          readCrossesLine(
+            oopAddr,
+            oopReadSize
+          )
+
+        val cacheEligible =
+          !push_data.oopCopyMeta.needQuery &&
+            !crossNow
+
+        val (cacheHit, cacheLine) =
+          lookupOopLineCache(line0Addr)
+
+        val pendingHit =
+          lookupOopPending(line0Addr)
+
+        val ownPendingFree =
+          !oopPendingValid(1)
+
+        val newCacheMiss =
+          cacheEligible &&
+            !cacheHit &&
+            !pendingHit &&
+            ownPendingFree
+
+        when(newCacheMiss) {
+          oopMissWant(1) :=
+            True
+        }
+
+        driveCopyFwd(
+          io.CopyFwdPush,
+          oopAddr,
+          oopReadSize,
+          push_data.oopCopyMeta
+        )
+
+        val reqMask =
+          requestedByteMask(oopReadSize)
+
+        val fullFwd =
+          push_data.oopCopyMeta.needQuery &&
+            (io.CopyFwdPush.mask & reqMask) === reqMask
 
         when(!io.CopyFwdPush.stall) {
           when(fullFwd) {
-            val newFromObj = decodeReadOopResp(io.CopyFwdPush.data)
+            push_data.fromObj :=
+              decodeReadOopResp(
+                io.CopyFwdPush.data
+              )
 
-            push_data.fromObj := newFromObj
+            goto(READ_MW_REQ0)
 
-            goto(READ_MW_REQ)
+          }.elsewhen(cacheEligible && cacheHit) {
+            val logicalData =
+              shiftLineToLogical(
+                cacheLine,
+                offsetNow
+              )
 
-          }.otherwise {
-            driveReadReq(io.PushMreq, push_data.task, oopReadSize)
+            push_data.fromObj :=
+              decodeReadOopResp(logicalData)
+
+            goto(READ_MW_REQ0)
+
+          }.elsewhen(cacheEligible && pendingHit) {
+            // 等 owner fill Cache。
+          }.elsewhen(
+            !cacheEligible ||
+              (newCacheMiss && oopMissGrant(1))
+          ) {
+            driveAlignedLineReadReq(
+              io.PushMreq,
+              line0Addr
+            )
 
             when(io.PushMreq.Request.fire) {
-              pushFwdMask := io.CopyFwdPush.mask
-              pushFwdData := io.CopyFwdPush.data
-              goto(READ_OOP_RESP)
+              pushOopOffset :=
+                offsetNow
+
+              pushOopCross :=
+                crossNow
+
+              pushFwdMask :=
+                io.CopyFwdPush.mask
+
+              pushFwdData :=
+                io.CopyFwdPush.data
+
+              pushLineSrc0 :=
+                io.PushMreq.Request.payload.RequestSourceID.resized
+
+              pushLineSrc1Valid :=
+                False
+
+              pushLineResp0Valid :=
+                False
+
+              pushLineResp1Valid :=
+                False
+
+              when(cacheEligible) {
+                oopPendingValid(1) :=
+                  True
+
+                oopPendingReady(1) :=
+                  False
+
+                oopPendingLineAddr(1) :=
+                  line0Addr
+              }
+
+              when(crossNow) {
+                goto(READ_OOP_REQ1)
+
+              }.otherwise {
+                goto(READ_OOP_WAIT)
+              }
             }
           }
         }
       }
     }
 
-    READ_OOP_RESP.whenIsActive {
-      io.PushMreq.Response.ready := True
+    READ_OOP_REQ1.whenIsActive {
+      val line1Addr =
+        (
+          alignToLine(push_data.task) +
+            U(LineBytesNum, MMUAddrWidth bits)
+        ).resize(MMUAddrWidth)
+
+      driveAlignedLineReadReq(
+        io.PushMreq,
+        line1Addr
+      )
+
+      io.PushMreq.Response.ready :=
+        True
 
       when(io.PushMreq.Response.fire) {
-        val rd = mergeCopyForward(io.PushMreq.Response.payload.ResponseData, pushFwdMask, pushFwdData)
-        val newFromObj = decodeReadOopResp(rd)
+        val respSid =
+          io.PushMreq.Response.payload.ResponseSourceID.resized
 
-        push_data.fromObj := newFromObj
+        when(
+          !pushLineResp0Valid &&
+            respSid === pushLineSrc0
+        ) {
+          pushLineData0 :=
+            io.PushMreq.Response.payload.ResponseData
 
-        goto(READ_MW_REQ)
+          pushLineResp0Valid :=
+            True
+        }
       }
-    }
-
-    READ_MW_REQ.whenIsActive {
-      driveReadReq(io.PushMreq, push_data.fromObj, mwReadSize)
 
       when(io.PushMreq.Request.fire) {
-        goto(READ_MW_RESP)
+        pushLineSrc1 :=
+          io.PushMreq.Request.payload.RequestSourceID.resized
+
+        pushLineSrc1Valid :=
+          True
+
+        goto(READ_OOP_WAIT)
       }
     }
 
-    READ_MW_RESP.whenIsActive {
-      io.PushMreq.Response.ready := True
+    READ_OOP_WAIT.whenIsActive {
+      io.PushMreq.Response.ready :=
+        True
+
+      val respFire =
+        io.PushMreq.Response.fire
+
+      val respSid =
+        io.PushMreq.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          pushLineSrc0,
+          pushLineSrc1,
+          pushLineSrc1Valid,
+          pushLineResp0Valid,
+          pushLineResp1Valid
+        )
+
+      when(respIs0) {
+        pushLineData0 :=
+          io.PushMreq.Response.payload.ResponseData
+
+        pushLineResp0Valid :=
+          True
+      }
+
+      when(respIs1) {
+        pushLineData1 :=
+          io.PushMreq.Response.payload.ResponseData
+
+        pushLineResp1Valid :=
+          True
+      }
+
+      val got0Now =
+        pushLineResp0Valid || respIs0
+
+      val got1Now =
+        !pushOopCross ||
+          pushLineResp1Valid ||
+          respIs1
+
+      val line0Now =
+        Mux(
+          respIs0,
+          io.PushMreq.Response.payload.ResponseData,
+          pushLineData0
+        )
+
+      val line1Now =
+        Mux(
+          respIs1,
+          io.PushMreq.Response.payload.ResponseData,
+          pushLineData1
+        )
+
+      when(got0Now && got1Now) {
+        val memoryLogical =
+          Mux(
+            pushOopCross,
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              pushOopOffset
+            ),
+            shiftLineToLogical(
+              line0Now,
+              pushOopOffset
+            )
+          )
+
+        val logicalData =
+          mergeCopyForward(
+            memoryLogical,
+            pushFwdMask,
+            pushFwdData
+          )
+
+        when(oopPendingValid(1)) {
+          oopPendingLineData(1) :=
+            line0Now
+
+          oopPendingReady(1) :=
+            True
+        }
+
+        push_data.fromObj :=
+          decodeReadOopResp(logicalData)
+
+        goto(READ_MW_REQ0)
+      }
+    }
+
+    READ_MW_REQ0.whenIsActive {
+      val mwAddr =
+        push_data.fromObj
+
+      val line0Addr =
+        alignToLine(mwAddr)
+
+      val offsetNow =
+        mwAddr(PreLineOffsetBits - 1 downto 0)
+
+      val crossNow =
+        readCrossesLine(
+          mwAddr,
+          mwReadSize
+        )
+
+      driveAlignedLineReadReq(
+        io.PushMreq,
+        line0Addr
+      )
+
+      when(io.PushMreq.Request.fire) {
+        pushMwOffset :=
+          offsetNow
+
+        pushMwCross :=
+          crossNow
+
+        pushLineSrc0 :=
+          io.PushMreq.Request.payload.RequestSourceID.resized
+
+        pushLineSrc1Valid :=
+          False
+
+        pushLineResp0Valid :=
+          False
+
+        pushLineResp1Valid :=
+          False
+
+        when(crossNow) {
+          goto(READ_MW_REQ1)
+
+        }.otherwise {
+          goto(READ_MW_WAIT)
+        }
+      }
+    }
+
+    READ_MW_REQ1.whenIsActive {
+      val line1Addr =
+        (
+          alignToLine(push_data.fromObj) +
+            U(LineBytesNum, MMUAddrWidth bits)
+        ).resize(MMUAddrWidth)
+
+      driveAlignedLineReadReq(
+        io.PushMreq,
+        line1Addr
+      )
+
+      io.PushMreq.Response.ready :=
+        True
 
       when(io.PushMreq.Response.fire) {
-        val rd = io.PushMreq.Response.payload.ResponseData
+        val respSid =
+          io.PushMreq.Response.payload.ResponseSourceID.resized
+
+        when(
+          !pushLineResp0Valid &&
+            respSid === pushLineSrc0
+        ) {
+          pushLineData0 :=
+            io.PushMreq.Response.payload.ResponseData
+
+          pushLineResp0Valid :=
+            True
+        }
+      }
+
+      when(io.PushMreq.Request.fire) {
+        pushLineSrc1 :=
+          io.PushMreq.Request.payload.RequestSourceID.resized
+
+        pushLineSrc1Valid :=
+          True
+
+        goto(READ_MW_WAIT)
+      }
+    }
+
+    READ_MW_WAIT.whenIsActive {
+      io.PushMreq.Response.ready :=
+        True
+
+      val respFire =
+        io.PushMreq.Response.fire
+
+      val respSid =
+        io.PushMreq.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          pushLineSrc0,
+          pushLineSrc1,
+          pushLineSrc1Valid,
+          pushLineResp0Valid,
+          pushLineResp1Valid
+        )
+
+      when(respIs0) {
+        pushLineData0 :=
+          io.PushMreq.Response.payload.ResponseData
+
+        pushLineResp0Valid :=
+          True
+      }
+
+      when(respIs1) {
+        pushLineData1 :=
+          io.PushMreq.Response.payload.ResponseData
+
+        pushLineResp1Valid :=
+          True
+      }
+
+      val got0Now =
+        pushLineResp0Valid || respIs0
+
+      val got1Now =
+        !pushMwCross ||
+          pushLineResp1Valid ||
+          respIs1
+
+      val line0Now =
+        Mux(
+          respIs0,
+          io.PushMreq.Response.payload.ResponseData,
+          pushLineData0
+        )
+
+      val line1Now =
+        Mux(
+          respIs1,
+          io.PushMreq.Response.payload.ResponseData,
+          pushLineData1
+        )
+
+      when(got0Now && got1Now) {
+        val rd =
+          Mux(
+            pushMwCross,
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              pushMwOffset
+            ),
+            shiftLineToLogical(
+              line0Now,
+              pushMwOffset
+            )
+          )
 
         when(mainIsIdle) {
-          copyFetchContextWithoutMw(main_data, push_data)
-          fillMwKlassLen(rd, main_data)
+          copyFetchContextWithoutMw(
+            main_data,
+            push_data
+          )
 
-          mainGotoSend := True
+          fillMwKlassLen(
+            rd,
+            main_data
+          )
+
+          mainGotoSend :=
+            True
+
           goto(IDLE)
 
         }.otherwise {
-          fillMwKlassLen(rd,push_data)
+          fillMwKlassLen(
+            rd,
+            push_data
+          )
+
           goto(SEND)
         }
       }
@@ -784,210 +1945,1081 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
     SEND.whenIsActive {
       when(mainIsIdle) {
-        // No field is overwritten in this branch, so the whole-bundle copy
-        // remains safe here.
-        main_data    := push_data
-        mainGotoSend := True
+        main_data :=
+          push_data
+
+        mainGotoSend :=
+          True
+
         goto(IDLE)
       }
     }
   }
 
   // ============================================================================
-  // PreFetch StateMachine — 预取任务并提前完成 OOP+MW 读取
+  // 4-way PreFetch workers
   //
-  // 两种工作模式：
+  // worker i 固定绑定 PreMreq{i}。
+  // 每个 worker 的 cross-line read:
+  //   REQ0.fire -> REQ1 尽快 fire -> WAIT 按 SourceID 收集两个 Response。
   //
-  // 1. Normal 模式（PushCount==0 且 pushFollowRem==0）：
-  //    从 TaskStack 的 PrePop 端口获取未来任务，完成读取后写入 preBuf[buf_top]，
-  //    同时 buf_top 递增、buf_count 递增。
-  //
-  // 2. Push-follow 模式（PushCount!=0 或 pushFollowRem!=0）：
-  //    TaskStack 刚完成一批 Push burst，这些新任务需要优先被 Fetch 消费。
-  //    此时 preFsm 将新任务插入到 buf_bottom 之前（即环形缓冲的消费端），
-  //    覆盖掉最旧的预取条目。如果缓冲区满了，会丢弃最旧的条目（buf_top 回退）。
-  //
-  //    子模式 2a: stackPushFollowActive（PushCount ≠ 0）
-  //       — 这是 Push burst 后的第一个 PrePop 周期
-  //       — pushFollowRem = PushCount - 1（记录还剩多少任务需要 PrePop）
-  //       — 将新任务插入到 buf_bottom - PushCount 的位置
-  //       — 覆盖掉超出缓冲区容量的旧条目
-  //
-  //    子模式 2b: fetchPushFollowActive（pushFollowRem ≠ 0）
-  //       — 后续的 PrePop 周期
-  //       — pushFollowRem 递减
-  //       — 新任务追加到 buf_work 的下一个位置
-  //
-  // 与 mainFsm 的交互：
-  //   — 如果 mainFsm 处于 waitForPrefetch 状态，且 preFsm 正在处理
-  //     buf_bottom 对应的条目，完成时会直接将结果交给 main_data 并触发
-  //     mainGotoSend，避免不必要的缓冲往返。
+  // OOP Cache/MSHR:
+  //   普通单-Line OOP 先查 Cache；
+  //   miss 且其它 source 已有 pending 同 Line -> 原地等；
+  //   miss 且无 pending -> 自己发 request，并占用 pending[2+i]。
   // ============================================================================
-  val preFsm = new StateMachine {
-    val IDLE          = new State with EntryPoint
-    val READ_OOP_REQ  = new State
-    val READ_OOP_RESP = new State
-    val READ_MW_REQ   = new State
-    val READ_MW_RESP  = new State
+  val PreFetchWorkerNum      = 4
+  val PreFetchWorkerIdxWidth = log2Up(PreFetchWorkerNum)
 
-    IDLE.whenIsActive {
-      val stackPushFollowActive = io.toFetch.PushCount =/= U(0, 32 bits)
-      val fetchPushFollowActive = pushFollowRem =/= U(0, 32 bits)
+  require(PreFetchWorkerNum <= PreFetchBufferNum)
+  require(preMreqs.length == PreFetchWorkerNum)
 
-      when(!stackPushFollowActive && !fetchPushFollowActive) {
-        io.toFetch.PrePop.ready := !waitForPrefetch && buf_free =/= U(0, buf_free.getWidth bits)
+  val PRE_STAGE_IDLE      = U(0, 3 bits)
+  val PRE_STAGE_OOP_REQ0  = U(1, 3 bits)
+  val PRE_STAGE_OOP_REQ1  = U(2, 3 bits)
+  val PRE_STAGE_OOP_WAIT  = U(3, 3 bits)
+  val PRE_STAGE_MW_REQ0   = U(4, 3 bits)
+  val PRE_STAGE_MW_REQ1   = U(5, 3 bits)
+  val PRE_STAGE_MW_WAIT   = U(6, 3 bits)
 
-        when(io.toFetch.PrePop.fire) {
-          buf_work := buf_top
-          resetSlot(buf_top)
+  val preWorkerBusy = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-          buf_top := bufInc(buf_top, U(1, PreFetchBufferWidth bits))
-          buf_count := buf_count + U(1, buf_count.getWidth bits)
+  val preWorkerStage = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, 3 bits))
+  )
 
-          receiveTask(io.toFetch.PrePop.payload, preBuf(buf_top))
+  val preWorkerSlot = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, PreFetchBufferWidth bits))
+  )
 
-          goto(READ_OOP_REQ)
-        }
+  val preWorkerFwdMask = Vec.fill(PreFetchWorkerNum)(
+    RegInit(B(0, LineBytesNum bits))
+  )
 
-      }.otherwise {
-        io.toFetch.PrePop.ready := !waitForPrefetch
+  val preWorkerFwdData = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, MMUDataWidth bits))
+  )
 
-        when(io.toFetch.PrePop.fire) {
-          when(!stackPushFollowActive) {
-            pushFollowRem := pushFollowRem - U(1, 32 bits)
+  val preWorkerOopOffset = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, PreLineOffsetBits bits))
+  )
 
-            val idx = bufInc(buf_work, U(1, PreFetchBufferWidth bits))
+  val preWorkerOopCross = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-            buf_work := idx
-            resetSlot(idx)
+  val preWorkerMwOffset = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, PreLineOffsetBits bits))
+  )
 
-            buf_count := buf_count + U(1, buf_count.getWidth bits)
+  val preWorkerMwCross = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-            receiveTask(io.toFetch.PrePop.payload, preBuf(idx))
+  // 每个 worker 一个逻辑 read 最多两个 SourceID / Response。
+  val preWorkerLineSrc0 = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  )
 
-            goto(READ_OOP_REQ)
+  val preWorkerLineSrc1 = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  )
 
-          }.otherwise {
-            val pushCount = Mux(
-              io.toFetch.PushCount > U(PreFetchBufferNum, 32 bits),
-              U(PreFetchBufferNum, 32 bits),
-              io.toFetch.PushCount
-            )
+  val preWorkerLineSrc1Valid = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-            val pushCountSmall = pushCount.resize(buf_count.getWidth)
+  val preWorkerLineResp0Valid = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-            val idx = bufDec(buf_bottom, pushCountSmall)
+  val preWorkerLineResp1Valid = Vec.fill(PreFetchWorkerNum)(
+    RegInit(False)
+  )
 
-            when(buf_free >= pushCountSmall) {
-              buf_count := buf_count + U(1, buf_count.getWidth bits)
+  val preWorkerLineData0 = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, MMUDataWidth bits))
+  )
 
-            }.otherwise {
-              val dropNum = pushCountSmall - buf_free
-              buf_top := bufDec(buf_top, dropNum)
-              buf_count := (buf_count + buf_free - pushCountSmall + U(1, buf_count.getWidth bits)).resized
-            }
+  val preWorkerLineData1 = Vec.fill(PreFetchWorkerNum)(
+    RegInit(U(0, MMUDataWidth bits))
+  )
 
-            buf_work      := idx
-            buf_bottom    := idx
-            pushFollowRem := pushCount - U(1, 32 bits)
+  val pushFollowWritePtr =
+    RegInit(U(0, PreFetchBufferWidth bits))
 
-            resetSlot(idx)
+  val preWorkerFreeVec =
+    Bits(PreFetchWorkerNum bits)
 
-            receiveTask(io.toFetch.PrePop.payload,preBuf(idx))
+  for (i <- 0 until PreFetchWorkerNum) {
+    preWorkerFreeVec(i) :=
+      !preWorkerBusy(i)
+  }
 
-            goto(READ_OOP_REQ)
-          }
-        }
-      }
+  val preHasFreeWorker =
+    preWorkerFreeVec.orR
+
+  val preFreeWorkerIdx =
+    PriorityMux(
+      (0 until PreFetchWorkerNum).map(i =>
+        (
+          preWorkerFreeVec(i),
+          U(i, PreFetchWorkerIdxWidth bits)
+        )
+      )
+    )
+
+  val allPreWorkersIdle =
+    !preWorkerBusy.asBits.orR
+
+  def slotOwnedByWorker(slot: UInt): Bool = {
+    val hitVec =
+      Bits(PreFetchWorkerNum bits)
+
+    for (i <- 0 until PreFetchWorkerNum) {
+      hitVec(i) :=
+        preWorkerBusy(i) &&
+          preWorkerSlot(i) === slot
     }
 
-    READ_OOP_REQ.whenIsActive {
-      when(preBuf(buf_work).oopType === U(PartialArrayOop)) {
-        preBuf(buf_work).fromObj := preBuf(buf_work).task
+    hitVec.orR
+  }
 
-        goto(READ_MW_REQ)
+  def startPreWorker(
+      workerIdx: UInt,
+      slotIdx: UInt,
+      payload: UInt
+  ): Unit = {
+    receiveTask(
+      payload,
+      preBuf(slotIdx)
+    )
+
+    preBuf(slotIdx).fromObj   := U(0, GCElementWidth bits)
+    preBuf(slotIdx).markWord  := U(0, GCElementWidth bits)
+    preBuf(slotIdx).klassPtr  := U(0, GCElementWidth bits)
+    preBuf(slotIdx).srcLength := U(0, 32 bits)
+
+    preBufValid(slotIdx) :=
+      True
+
+    preBufDone(slotIdx) :=
+      False
+
+    preWorkerBusy(workerIdx) :=
+      True
+
+    preWorkerStage(workerIdx) :=
+      PRE_STAGE_OOP_REQ0
+
+    preWorkerSlot(workerIdx) :=
+      slotIdx
+
+    preWorkerFwdMask(workerIdx) :=
+      B(0, LineBytesNum bits)
+
+    preWorkerFwdData(workerIdx) :=
+      U(0, MMUDataWidth bits)
+
+    preWorkerLineSrc1Valid(workerIdx) :=
+      False
+
+    preWorkerLineResp0Valid(workerIdx) :=
+      False
+
+    preWorkerLineResp1Valid(workerIdx) :=
+      False
+  }
+
+  // --------------------------------------------------------------------------
+  // PrePop allocation
+  // --------------------------------------------------------------------------
+  val stackPushFollowActive =
+    io.toFetch.PushCount =/= U(0, 32 bits)
+
+  val fetchPushFollowActive =
+    pushFollowRem =/= U(0, 32 bits)
+
+  when(
+    !stackPushFollowActive &&
+      !fetchPushFollowActive
+  ) {
+    val normalAllocSlot =
+      buf_top
+
+    val normalSlotFree =
+      !preBufValid(normalAllocSlot) &&
+        !slotOwnedByWorker(normalAllocSlot)
+
+    io.toFetch.PrePop.ready :=
+      preHasFreeWorker &&
+        buf_free =/= U(0, buf_free.getWidth bits) &&
+        normalSlotFree
+
+    when(io.toFetch.PrePop.fire) {
+      startPreWorker(
+        preFreeWorkerIdx,
+        normalAllocSlot,
+        io.toFetch.PrePop.payload
+      )
+
+      buf_top :=
+        bufInc(
+          buf_top,
+          U(1, PreFetchBufferWidth bits)
+        )
+
+      buf_count :=
+        buf_count +
+          U(1, buf_count.getWidth bits)
+    }
+
+  }.elsewhen(stackPushFollowActive) {
+    val canStartPushFollow =
+      preHasFreeWorker &&
+        allPreWorkersIdle &&
+        !waitForPrefetch
+
+    io.toFetch.PrePop.ready :=
+      canStartPushFollow
+
+    when(io.toFetch.PrePop.fire) {
+      val pushCount =
+        Mux(
+          io.toFetch.PushCount >
+            U(PreFetchBufferNum, 32 bits),
+          U(PreFetchBufferNum, 32 bits),
+          io.toFetch.PushCount
+        )
+
+      val pushCountSmall =
+        pushCount.resize(buf_count.getWidth)
+
+      val firstSlot =
+        bufDec(
+          buf_bottom,
+          pushCountSmall
+        )
+
+      when(buf_free >= pushCountSmall) {
+        buf_count :=
+          buf_count +
+            U(1, buf_count.getWidth bits)
 
       }.otherwise {
-        driveCopyFwd(io.CopyFwdPre, preBuf(buf_work).task, oopReadSize, preBuf(buf_work).oopCopyMeta)
+        val dropNum =
+          pushCountSmall - buf_free
 
-        val reqMask = requestedByteMask(oopReadSize)
-        val fullFwd = (io.CopyFwdPre.mask & reqMask) === reqMask
+        buf_top :=
+          bufDec(
+            buf_top,
+            dropNum
+          )
+
+        buf_count :=
+          (
+            buf_count +
+              buf_free -
+              pushCountSmall +
+              U(1, buf_count.getWidth bits)
+          ).resized
+      }
+
+      buf_bottom :=
+        firstSlot
+
+      pushFollowWritePtr :=
+        firstSlot
+
+      pushFollowRem :=
+        pushCount -
+          U(1, 32 bits)
+
+      startPreWorker(
+        preFreeWorkerIdx,
+        firstSlot,
+        io.toFetch.PrePop.payload
+      )
+    }
+
+  }.otherwise {
+    val nextFollowSlot =
+      bufInc(
+        pushFollowWritePtr,
+        U(1, PreFetchBufferWidth bits)
+      )
+
+    val nextFollowSlotSafe =
+      !slotOwnedByWorker(nextFollowSlot) &&
+        !(waitForPrefetch && waitPrefetchSlot === nextFollowSlot)
+
+    io.toFetch.PrePop.ready :=
+      preHasFreeWorker &&
+        nextFollowSlotSafe
+
+    when(io.toFetch.PrePop.fire) {
+      pushFollowWritePtr :=
+        nextFollowSlot
+
+      pushFollowRem :=
+        pushFollowRem -
+          U(1, 32 bits)
+
+      buf_count :=
+        buf_count +
+          U(1, buf_count.getWidth bits)
+
+      startPreWorker(
+        preFreeWorkerIdx,
+        nextFollowSlot,
+        io.toFetch.PrePop.payload
+      )
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Shared CopyFwdPre arbitration
+  // --------------------------------------------------------------------------
+  val preCopyReqVec =
+    Bits(PreFetchWorkerNum bits)
+
+  for (i <- 0 until PreFetchWorkerNum) {
+    val slotIdx =
+      preWorkerSlot(i)
+
+    preCopyReqVec(i) :=
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_OOP_REQ0 &&
+        preBuf(slotIdx).oopType =/= U(PartialArrayOop) &&
+        preBuf(slotIdx).oopCopyMeta.needQuery
+  }
+
+  val criticalCopyReqVec =
+    Bits(PreFetchWorkerNum bits)
+
+  for (i <- 0 until PreFetchWorkerNum) {
+    criticalCopyReqVec(i) :=
+      preCopyReqVec(i) &&
+        waitForPrefetch &&
+        preWorkerSlot(i) === buf_bottom
+  }
+
+  val hasCriticalCopyReq =
+    criticalCopyReqVec.orR
+
+  val normalCopyGrant =
+    Bits(PreFetchWorkerNum bits)
+
+  normalCopyGrant(0) :=
+    preCopyReqVec(0)
+
+  normalCopyGrant(1) :=
+    preCopyReqVec(1) &&
+      !preCopyReqVec(0)
+
+  normalCopyGrant(2) :=
+    preCopyReqVec(2) &&
+      !preCopyReqVec(0) &&
+      !preCopyReqVec(1)
+
+  normalCopyGrant(3) :=
+    preCopyReqVec(3) &&
+      !preCopyReqVec(0) &&
+      !preCopyReqVec(1) &&
+      !preCopyReqVec(2)
+
+  val criticalCopyGrant =
+    Bits(PreFetchWorkerNum bits)
+
+  criticalCopyGrant(0) :=
+    criticalCopyReqVec(0)
+
+  criticalCopyGrant(1) :=
+    criticalCopyReqVec(1) &&
+      !criticalCopyReqVec(0)
+
+  criticalCopyGrant(2) :=
+    criticalCopyReqVec(2) &&
+      !criticalCopyReqVec(0) &&
+      !criticalCopyReqVec(1)
+
+  criticalCopyGrant(3) :=
+    criticalCopyReqVec(3) &&
+      !criticalCopyReqVec(0) &&
+      !criticalCopyReqVec(1) &&
+      !criticalCopyReqVec(2)
+
+  val preCopyGrant =
+    Bits(PreFetchWorkerNum bits)
+
+  for (i <- 0 until PreFetchWorkerNum) {
+    preCopyGrant(i) :=
+      Mux(
+        hasCriticalCopyReq,
+        criticalCopyGrant(i),
+        normalCopyGrant(i)
+      )
+  }
+
+  // --------------------------------------------------------------------------
+  // Worker execution
+  // --------------------------------------------------------------------------
+  for (i <- 0 until PreFetchWorkerNum) {
+    val m =
+      preMreqs(i)
+
+    val slotIdx =
+      preWorkerSlot(i)
+
+    val pendingIdx =
+      2 + i
+
+    val oopAddr =
+      preBuf(slotIdx).task
+
+    val oopLine0Addr =
+      alignToLine(oopAddr)
+
+    val oopOffsetNow =
+      oopAddr(PreLineOffsetBits - 1 downto 0)
+
+    val oopCrossNow =
+      readCrossesLine(
+        oopAddr,
+        oopReadSize
+      )
+
+    val oopLine1Addr =
+      (
+        oopLine0Addr +
+          U(LineBytesNum, MMUAddrWidth bits)
+      ).resize(MMUAddrWidth)
+
+    val mwAddr =
+      preBuf(slotIdx).fromObj
+
+    val mwLine0Addr =
+      alignToLine(mwAddr)
+
+    val mwOffsetNow =
+      mwAddr(PreLineOffsetBits - 1 downto 0)
+
+    val mwCrossNow =
+      readCrossesLine(
+        mwAddr,
+        mwReadSize
+      )
+
+    val mwLine1Addr =
+      (
+        mwLine0Addr +
+          U(LineBytesNum, MMUAddrWidth bits)
+      ).resize(MMUAddrWidth)
+
+    // ========================================================================
+    // OOP REQ0
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_OOP_REQ0
+    ) {
+      when(
+        preBuf(slotIdx).oopType === U(PartialArrayOop)
+      ) {
+        preBuf(slotIdx).fromObj :=
+          preBuf(slotIdx).task
+
+        preWorkerStage(i) :=
+          PRE_STAGE_MW_REQ0
+
+      }.elsewhen(
+        !preBuf(slotIdx).oopCopyMeta.needQuery
+      ) {
+        val (cacheHit, cacheLine) =
+          lookupOopLineCache(oopLine0Addr)
+
+        val pendingHit =
+          lookupOopPending(oopLine0Addr)
+
+        val ownPendingFree =
+          !oopPendingValid(pendingIdx)
+
+        val newCacheMiss =
+          !oopCrossNow &&
+            !cacheHit &&
+            !pendingHit &&
+            ownPendingFree
+
+        when(newCacheMiss) {
+          oopMissWant(pendingIdx) :=
+            True
+        }
+
+        when(!oopCrossNow && cacheHit) {
+          val logicalData =
+            shiftLineToLogical(
+              cacheLine,
+              oopOffsetNow
+            )
+
+          preBuf(slotIdx).fromObj :=
+            decodeReadOopResp(logicalData)
+
+          preWorkerStage(i) :=
+            PRE_STAGE_MW_REQ0
+
+        }.elsewhen(!oopCrossNow && pendingHit) {
+          // 等 owner fill Cache。
+        }.elsewhen(
+          oopCrossNow ||
+            (newCacheMiss && oopMissGrant(pendingIdx))
+        ) {
+          driveAlignedLineReadReq(
+            m,
+            oopLine0Addr
+          )
+
+          when(m.Request.fire) {
+            preWorkerOopOffset(i) :=
+              oopOffsetNow
+
+            preWorkerOopCross(i) :=
+              oopCrossNow
+
+            preWorkerFwdMask(i) :=
+              B(0, LineBytesNum bits)
+
+            preWorkerFwdData(i) :=
+              U(0, MMUDataWidth bits)
+
+            preWorkerLineSrc0(i) :=
+              m.Request.payload.RequestSourceID.resized
+
+            preWorkerLineSrc1Valid(i) :=
+              False
+
+            preWorkerLineResp0Valid(i) :=
+              False
+
+            preWorkerLineResp1Valid(i) :=
+              False
+
+            when(!oopCrossNow) {
+              oopPendingValid(pendingIdx) :=
+                True
+
+              oopPendingReady(pendingIdx) :=
+                False
+
+              oopPendingLineAddr(pendingIdx) :=
+                oopLine0Addr
+            }
+
+            when(oopCrossNow) {
+              preWorkerStage(i) :=
+                PRE_STAGE_OOP_REQ1
+
+            }.otherwise {
+              preWorkerStage(i) :=
+                PRE_STAGE_OOP_WAIT
+            }
+          }
+        }
+
+      }.elsewhen(preCopyGrant(i)) {
+        driveCopyFwd(
+          io.CopyFwdPre,
+          oopAddr,
+          oopReadSize,
+          preBuf(slotIdx).oopCopyMeta
+        )
+
+        val reqMask =
+          requestedByteMask(oopReadSize)
+
+        val fullFwd =
+          (io.CopyFwdPre.mask & reqMask) === reqMask
 
         when(!io.CopyFwdPre.stall) {
           when(fullFwd) {
-            val newFromObj = decodeReadOopResp(io.CopyFwdPre.data)
+            preBuf(slotIdx).fromObj :=
+              decodeReadOopResp(
+                io.CopyFwdPre.data
+              )
 
-            preBuf(buf_work).fromObj := newFromObj
-
-            goto(READ_MW_REQ)
+            preWorkerStage(i) :=
+              PRE_STAGE_MW_REQ0
 
           }.otherwise {
-            driveReadReq(io.PreMreq, preBuf(buf_work).task, oopReadSize)
+            driveAlignedLineReadReq(
+              m,
+              oopLine0Addr
+            )
 
-            when(io.PreMreq.Request.fire) {
-              preFwdMask := io.CopyFwdPre.mask
-              preFwdData := io.CopyFwdPre.data
-              goto(READ_OOP_RESP)
+            when(m.Request.fire) {
+              preWorkerOopOffset(i) :=
+                oopOffsetNow
+
+              preWorkerOopCross(i) :=
+                oopCrossNow
+
+              preWorkerFwdMask(i) :=
+                io.CopyFwdPre.mask
+
+              preWorkerFwdData(i) :=
+                io.CopyFwdPre.data
+
+              preWorkerLineSrc0(i) :=
+                m.Request.payload.RequestSourceID.resized
+
+              preWorkerLineSrc1Valid(i) :=
+                False
+
+              preWorkerLineResp0Valid(i) :=
+                False
+
+              preWorkerLineResp1Valid(i) :=
+                False
+
+              when(oopCrossNow) {
+                preWorkerStage(i) :=
+                  PRE_STAGE_OOP_REQ1
+
+              }.otherwise {
+                preWorkerStage(i) :=
+                  PRE_STAGE_OOP_WAIT
+              }
             }
           }
         }
       }
     }
 
-    READ_OOP_RESP.whenIsActive {
-      io.PreMreq.Response.ready := True
+    // ========================================================================
+    // OOP REQ1
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_OOP_REQ1
+    ) {
+      driveAlignedLineReadReq(
+        m,
+        oopLine1Addr
+      )
 
-      when(io.PreMreq.Response.fire) {
-        val rd = mergeCopyForward(io.PreMreq.Response.payload.ResponseData, preFwdMask, preFwdData)
-        val newFromObj = decodeReadOopResp(rd)
+      m.Response.ready :=
+        True
 
-        preBuf(buf_work).fromObj := newFromObj
+      when(m.Response.fire) {
+        val respSid =
+          m.Response.payload.ResponseSourceID.resized
 
-        goto(READ_MW_REQ)
+        when(
+          !preWorkerLineResp0Valid(i) &&
+            respSid === preWorkerLineSrc0(i)
+        ) {
+          preWorkerLineData0(i) :=
+            m.Response.payload.ResponseData
+
+          preWorkerLineResp0Valid(i) :=
+            True
+        }
+      }
+
+      when(m.Request.fire) {
+        preWorkerLineSrc1(i) :=
+          m.Request.payload.RequestSourceID.resized
+
+        preWorkerLineSrc1Valid(i) :=
+          True
+
+        preWorkerStage(i) :=
+          PRE_STAGE_OOP_WAIT
       }
     }
 
-    READ_MW_REQ.whenIsActive {
-      driveReadReq(io.PreMreq, preBuf(buf_work).fromObj, mwReadSize)
+    // ========================================================================
+    // OOP WAIT
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_OOP_WAIT
+    ) {
+      m.Response.ready :=
+        True
 
-      when(io.PreMreq.Request.fire) {
-        goto(READ_MW_RESP)
+      val respFire =
+        m.Response.fire
+
+      val respSid =
+        m.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          preWorkerLineSrc0(i),
+          preWorkerLineSrc1(i),
+          preWorkerLineSrc1Valid(i),
+          preWorkerLineResp0Valid(i),
+          preWorkerLineResp1Valid(i)
+        )
+
+      when(respIs0) {
+        preWorkerLineData0(i) :=
+          m.Response.payload.ResponseData
+
+        preWorkerLineResp0Valid(i) :=
+          True
       }
-    }
 
-    READ_MW_RESP.whenIsActive {
-      io.PreMreq.Response.ready := True
+      when(respIs1) {
+        preWorkerLineData1(i) :=
+          m.Response.payload.ResponseData
 
-      when(io.PreMreq.Response.fire) {
-        val rd = io.PreMreq.Response.payload.ResponseData
-        val currentFromObj = preBuf(buf_work).fromObj
+        preWorkerLineResp1Valid(i) :=
+          True
+      }
 
-        val finalMw = resolveForwardMark(currentFromObj, rd(GCElementWidth - 1 downto 0))
+      val got0Now =
+        preWorkerLineResp0Valid(i) ||
+          respIs0
 
-        when(waitForPrefetch && mainIsIdle && buf_work === buf_bottom) {
-          waitForPrefetch := False
+      val got1Now =
+        !preWorkerOopCross(i) ||
+          preWorkerLineResp1Valid(i) ||
+          respIs1
 
-          copyFetchContextWithoutMw(main_data, preBuf(buf_bottom))
-          main_data.markWord := finalMw
-          fillKlassLen(rd, main_data)
+      val line0Now =
+        Mux(
+          respIs0,
+          m.Response.payload.ResponseData,
+          preWorkerLineData0(i)
+        )
 
-          mainGotoSend := True
+      val line1Now =
+        Mux(
+          respIs1,
+          m.Response.payload.ResponseData,
+          preWorkerLineData1(i)
+        )
 
-          resetSlot(buf_bottom)
-          buf_bottom := bufInc(buf_bottom, U(1, PreFetchBufferWidth bits))
-          buf_count := buf_count - U(1, buf_count.getWidth bits)
+      when(got0Now && got1Now) {
+        val memoryLogical =
+          Mux(
+            preWorkerOopCross(i),
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              preWorkerOopOffset(i)
+            ),
+            shiftLineToLogical(
+              line0Now,
+              preWorkerOopOffset(i)
+            )
+          )
 
-        }.otherwise {
-          preBuf(buf_work).markWord := finalMw
+        val logicalData =
+          mergeCopyForward(
+            memoryLogical,
+            preWorkerFwdMask(i),
+            preWorkerFwdData(i)
+          )
 
-          fillKlassLen(rd, preBuf(buf_work))
+        when(oopPendingValid(pendingIdx)) {
+          oopPendingLineData(pendingIdx) :=
+            line0Now
 
-          preBufDone(buf_work) := True
+          oopPendingReady(pendingIdx) :=
+            True
         }
 
-        goto(IDLE)
+        preBuf(slotIdx).fromObj :=
+          decodeReadOopResp(logicalData)
+
+        preWorkerStage(i) :=
+          PRE_STAGE_MW_REQ0
       }
     }
+
+    // ========================================================================
+    // MW REQ0
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_MW_REQ0
+    ) {
+      driveAlignedLineReadReq(
+        m,
+        mwLine0Addr
+      )
+
+      when(m.Request.fire) {
+        preWorkerMwOffset(i) :=
+          mwOffsetNow
+
+        preWorkerMwCross(i) :=
+          mwCrossNow
+
+        preWorkerLineSrc0(i) :=
+          m.Request.payload.RequestSourceID.resized
+
+        preWorkerLineSrc1Valid(i) :=
+          False
+
+        preWorkerLineResp0Valid(i) :=
+          False
+
+        preWorkerLineResp1Valid(i) :=
+          False
+
+        when(mwCrossNow) {
+          preWorkerStage(i) :=
+            PRE_STAGE_MW_REQ1
+
+        }.otherwise {
+          preWorkerStage(i) :=
+            PRE_STAGE_MW_WAIT
+        }
+      }
+    }
+
+    // ========================================================================
+    // MW REQ1
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_MW_REQ1
+    ) {
+      driveAlignedLineReadReq(
+        m,
+        mwLine1Addr
+      )
+
+      m.Response.ready :=
+        True
+
+      when(m.Response.fire) {
+        val respSid =
+          m.Response.payload.ResponseSourceID.resized
+
+        when(
+          !preWorkerLineResp0Valid(i) &&
+            respSid === preWorkerLineSrc0(i)
+        ) {
+          preWorkerLineData0(i) :=
+            m.Response.payload.ResponseData
+
+          preWorkerLineResp0Valid(i) :=
+            True
+        }
+      }
+
+      when(m.Request.fire) {
+        preWorkerLineSrc1(i) :=
+          m.Request.payload.RequestSourceID.resized
+
+        preWorkerLineSrc1Valid(i) :=
+          True
+
+        preWorkerStage(i) :=
+          PRE_STAGE_MW_WAIT
+      }
+    }
+
+    // ========================================================================
+    // MW WAIT
+    // ========================================================================
+    when(
+      preWorkerBusy(i) &&
+        preWorkerStage(i) === PRE_STAGE_MW_WAIT
+    ) {
+      m.Response.ready :=
+        True
+
+      val respFire =
+        m.Response.fire
+
+      val respSid =
+        m.Response.payload.ResponseSourceID.resized
+
+      val (respIs0, respIs1) =
+        classifyTwoLineResp(
+          respFire,
+          respSid,
+          preWorkerLineSrc0(i),
+          preWorkerLineSrc1(i),
+          preWorkerLineSrc1Valid(i),
+          preWorkerLineResp0Valid(i),
+          preWorkerLineResp1Valid(i)
+        )
+
+      when(respIs0) {
+        preWorkerLineData0(i) :=
+          m.Response.payload.ResponseData
+
+        preWorkerLineResp0Valid(i) :=
+          True
+      }
+
+      when(respIs1) {
+        preWorkerLineData1(i) :=
+          m.Response.payload.ResponseData
+
+        preWorkerLineResp1Valid(i) :=
+          True
+      }
+
+      val got0Now =
+        preWorkerLineResp0Valid(i) ||
+          respIs0
+
+      val got1Now =
+        !preWorkerMwCross(i) ||
+          preWorkerLineResp1Valid(i) ||
+          respIs1
+
+      val line0Now =
+        Mux(
+          respIs0,
+          m.Response.payload.ResponseData,
+          preWorkerLineData0(i)
+        )
+
+      val line1Now =
+        Mux(
+          respIs1,
+          m.Response.payload.ResponseData,
+          preWorkerLineData1(i)
+        )
+
+      when(got0Now && got1Now) {
+        val rd =
+          Mux(
+            preWorkerMwCross(i),
+            mergeTwoReadLines(
+              line0Now,
+              line1Now,
+              preWorkerMwOffset(i)
+            ),
+            shiftLineToLogical(
+              line0Now,
+              preWorkerMwOffset(i)
+            )
+          )
+
+        val currentFromObj =
+          preBuf(slotIdx).fromObj
+
+        val finalMw =
+          resolveForwardMark(
+            currentFromObj,
+            rd(GCElementWidth - 1 downto 0)
+          )
+
+        preBuf(slotIdx).markWord :=
+          finalMw
+
+        fillKlassLen(
+          rd,
+          preBuf(slotIdx)
+        )
+
+        preBufDone(slotIdx) :=
+          True
+
+        preWorkerBusy(i) :=
+          False
+
+        preWorkerStage(i) :=
+          PRE_STAGE_IDLE
+      }
+    }
+  }
+
+  // ============================================================================
+  // OOP Line Cache fill/update
+  //
+  // pending response 可以同周期到达多个；它们先各自保存在 pendingLineData。
+  // Cache 每拍 drain 一个 ready pending entry，因此不会丢 fill，也不会导致
+  // waiter 因“owner pending 已清但 Cache 没写入”而重新重复发请求。
+  //
+  // 不再根据 main/push/pre 短暂 idle 自动 flush。
+  // Cache 仅在 reset 显式失效。
+  // ============================================================================
+  val oopPendingReadyVec =
+    Bits(OopPendingNum bits)
+
+  for (i <- 0 until OopPendingNum) {
+    oopPendingReadyVec(i) :=
+      oopPendingValid(i) &&
+        oopPendingReady(i)
+  }
+
+  val oopPendingFillAny =
+    oopPendingReadyVec.orR
+
+  val oopPendingFillIdx =
+    UInt(OopPendingIdxWidth bits)
+
+  oopPendingFillIdx :=
+    PriorityMux(
+      (0 until OopPendingNum).map(i =>
+        (
+          oopPendingReadyVec(i),
+          U(i, OopPendingIdxWidth bits)
+        )
+      )
+    )
+
+  val selectedOopFillAddr =
+    oopPendingLineAddr(oopPendingFillIdx)
+
+  val selectedOopFillData =
+    oopPendingLineData(oopPendingFillIdx)
+
+  val oopCacheExistingHitVec =
+    Bits(OopLineCacheEntries bits)
+
+  for (i <- 0 until OopLineCacheEntries) {
+    oopCacheExistingHitVec(i) :=
+      oopLineCacheValid(i) &&
+        oopLineCacheTag(i) === selectedOopFillAddr
+  }
+
+  val oopCacheExistingHit =
+    oopCacheExistingHitVec.orR
+
+  val oopCacheExistingIdx =
+    OHToUInt(oopCacheExistingHitVec)
+
+  when(oopPendingFillAny) {
+    when(oopCacheExistingHit) {
+      oopLineCacheData(oopCacheExistingIdx) :=
+        selectedOopFillData
+
+    }.otherwise {
+      oopLineCacheValid(oopLineCacheReplacePtr) :=
+        True
+
+      oopLineCacheTag(oopLineCacheReplacePtr) :=
+        selectedOopFillAddr
+
+      oopLineCacheData(oopLineCacheReplacePtr) :=
+        selectedOopFillData
+
+      oopLineCacheReplacePtr :=
+        oopLineCacheReplacePtr +
+          U(1, OopLineCacheIdxWidth bits)
+    }
+
+    oopPendingValid(oopPendingFillIdx) :=
+      False
+
+    oopPendingReady(oopPendingFillIdx) :=
+      False
   }
 
   // 转发通知修补已固化的 MarkWord
@@ -1003,7 +3035,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
 
     for (i <- 0 until PreFetchBufferNum) {
-      when(preBufDone(i) && preBuf(i).fromObj === incomingFwdObj) {
+      when(preBufValid(i) && preBufDone(i) && preBuf(i).fromObj === incomingFwdObj) {
         preBuf(i).markWord := incomingFwdValue
       }
     }
